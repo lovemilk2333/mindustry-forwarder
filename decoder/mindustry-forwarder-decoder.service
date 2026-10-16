@@ -1,0 +1,11 @@
+[Unit]
+Description=mindustry-forwarder-decoder
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mindustry-forwarder-decoder
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
