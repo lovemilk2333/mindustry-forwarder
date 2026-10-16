@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,11 +11,18 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/alexflint/go-arg"
 )
+
+//go:embed setup-lo-transparent.sh
+var setupLoTransparentScript []byte
 
 const MIN_CONTEXT_LENGTH = 1 + 2 // flags (int8) + port (uint16 BE)
 const IPV4_LENGTH = 4            // 32 bit = 4 Byte
@@ -52,7 +60,19 @@ var args struct {
 	MindustryPortOnly uint16        `arg:"-p,--mindustry-port" help:"shorthand: use 127.0.0.1:<port> as Mindustry address (overrides --mindustry host)"`
 	Timeout           time.Duration `default:"5s"`
 	NoTransparent     bool          `arg:"--no-transparent" help:"never use IP_TRANSPARENT (always dial with local address)"`
+	SetupLoIP         string        `arg:"--setup-lo-ip" default:"172.31.255.1" help:"lo alias IP used when backend is 127/8 (auto setup)"`
+	NoAutoSetupLo     bool          `arg:"--no-auto-setup-lo" help:"do not auto-configure lo alias when backend is 127/8"`
 }
+
+// set when auto setup-lo succeeded; cleared by undo on exit.
+var loAliasActive string
+
+// client IPs we installed as `ip route local … dev lo` so SYN-ACK/UDP
+// replies to the spoofed source stay on this host. Refcounted per session.
+var (
+	localRouteMu   sync.Mutex
+	localRouteRefs = map[string]int{}
+)
 
 func parse_context(data []byte) (int, *Context, error) {
 	length := len(data)
@@ -176,49 +196,119 @@ func base_network(is_tcp bool) string {
 	return "udp"
 }
 
-func dial_backend(ctx *Context, backend_addr string) (net.Conn, error) {
-	// "tcp"/"udp" lets Go pick family from backend_addr (correct for plain dial
-	// to 127.0.0.1 even when the client context is IPv6).
+// ensure_client_local_route makes the kernel treat clientIP as a local
+// address on lo. Without this, SYN-ACK/UDP replies to the spoofed source
+// are routed off-box and the transparent handshake times out.
+func ensure_client_local_route(clientIP string) error {
+	localRouteMu.Lock()
+	defer localRouteMu.Unlock()
+	if localRouteRefs[clientIP] > 0 {
+		localRouteRefs[clientIP]++
+		return nil
+	}
+	// `ip route replace local <ip>/32 dev lo` — idempotent, needs root.
+	cmd := exec.Command("ip", "route", "replace", "local", clientIP+"/32", "dev", "lo")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip route replace local %s/32 dev lo: %v (%s)", clientIP, err, bytesTrim(out))
+	}
+	localRouteRefs[clientIP] = 1
+	return nil
+}
+
+func release_client_local_route(clientIP string) {
+	if clientIP == "" {
+		return
+	}
+	localRouteMu.Lock()
+	defer localRouteMu.Unlock()
+	n := localRouteRefs[clientIP]
+	if n <= 0 {
+		return
+	}
+	if n > 1 {
+		localRouteRefs[clientIP] = n - 1
+		return
+	}
+	delete(localRouteRefs, clientIP)
+	cmd := exec.Command("ip", "route", "del", "local", clientIP+"/32", "dev", "lo")
+	_ = cmd.Run() // best-effort; may already be gone
+}
+
+func release_all_client_local_routes() {
+	localRouteMu.Lock()
+	ips := make([]string, 0, len(localRouteRefs))
+	for ip := range localRouteRefs {
+		ips = append(ips, ip)
+	}
+	localRouteRefs = map[string]int{}
+	localRouteMu.Unlock()
+	for _, ip := range ips {
+		cmd := exec.Command("ip", "route", "del", "local", ip+"/32", "dev", "lo")
+		_ = cmd.Run()
+	}
+}
+
+func bytesTrim(b []byte) string {
+	s := string(b)
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
+}
+
+// dial_backend returns the backend conn, whether the source IP was actually
+// spoofed (transparent), and an optional clientIP that holds a local route
+// (caller must release_client_local_route when the session ends).
+func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent bool, routeIP string, err error) {
 	network := base_network(ctx.is_tcp)
 	use_tproxy := want_transparent(backend_addr)
 
+	if !use_tproxy {
+		plain := net.Dialer{Timeout: args.Timeout}
+		c, e := plain.DialContext(context.Background(), network, backend_addr)
+		return c, false, "", e
+	}
+
+	clientIP := ctx.ip.String()
+	if e := ensure_client_local_route(clientIP); e != nil {
+		log.Printf("%s cannot install local route for spoofed source: %v", ctx, e)
+		// still try dial; may work if IP is already local
+	} else {
+		routeIP = clientIP
+	}
+
+	tnet := network
+	if ctx.is_ipv6 {
+		tnet = network + "6"
+	} else {
+		tnet = network + "4"
+	}
+	var local net.Addr
+	if ctx.is_tcp {
+		local, _ = net.ResolveTCPAddr(tnet, net.JoinHostPort(clientIP, "0"))
+	} else {
+		local, _ = net.ResolveUDPAddr(tnet, net.JoinHostPort(clientIP, "0"))
+	}
+
 	dialer := net.Dialer{
-		Timeout: args.Timeout,
-	}
-
-	if use_tproxy {
-		// LocalAddr family must match the client IP we spoof.
-		tnet := network
-		if ctx.is_ipv6 {
-			tnet = network + "6"
-		} else {
-			tnet = network + "4"
-		}
-		var local net.Addr
-		if ctx.is_tcp {
-			local, _ = net.ResolveTCPAddr(tnet, net.JoinHostPort(ctx.ip.String(), "0"))
-		} else {
-			local, _ = net.ResolveUDPAddr(tnet, net.JoinHostPort(ctx.ip.String(), "0"))
-		}
-		dialer.LocalAddr = local
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
+		Timeout:   args.Timeout,
+		LocalAddr: local,
+		Control: func(network, address string, c syscall.RawConn) error {
 			return set_ip_transparent(network, c)
-		}
-		network = tnet
+		},
 	}
 
-	conn, err := dialer.DialContext(context.Background(), network, backend_addr)
-	if err != nil {
-		// If transparent dial failed, fall back once without spoof so the
-		// session still works (e.g. missing CAP_NET_ADMIN / route).
-		if use_tproxy {
-			log.Printf("%s transparent dial failed (%v), retry without IP_TRANSPARENT", ctx, err)
-			plain := net.Dialer{Timeout: args.Timeout}
-			return plain.DialContext(context.Background(), base_network(ctx.is_tcp), backend_addr)
-		}
-		return nil, err
+	c, e := dialer.DialContext(context.Background(), tnet, backend_addr)
+	if e != nil {
+		log.Printf("%s transparent dial failed (%v), retry without IP_TRANSPARENT", ctx, e)
+		release_client_local_route(routeIP)
+		routeIP = ""
+		plain := net.Dialer{Timeout: args.Timeout}
+		c2, e2 := plain.DialContext(context.Background(), network, backend_addr)
+		return c2, false, "", e2
 	}
-	return conn, nil
+	return c, true, routeIP, nil
 }
 
 func copy_tcp(dst, src net.Conn, label string, session *Context) {
@@ -311,15 +401,16 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 	// clear header deadline for the rest of the session
 	_ = conn.SetReadDeadline(time.Time{})
 
-	backend_conn, err := dial_backend(ctx, backend_addr)
+	backend_conn, transparent, routeIP, err := dial_backend(ctx, backend_addr)
 	if err != nil {
 		log.Printf("%s cannot connect to Mindustry Server: %v", ctx, err)
 		return
 	}
 	defer backend_conn.Close()
+	defer release_client_local_route(routeIP)
 
 	mode := "plain"
-	if want_transparent(backend_addr) {
+	if transparent {
 		mode = "transparent"
 	}
 	log.Printf("%s session opened (%s) -> %s", ctx, mode, backend_addr)
@@ -345,9 +436,99 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 	log.Printf("%s session closed", ctx)
 }
 
+// run_embedded_setup_lo extracts the embedded script to a temp file, runs it,
+// then deletes the temp tree (use-once). Returns the script exit code.
+func run_embedded_setup_lo(undo bool, aliasIP string, quiet bool) int {
+	dir, err := os.MkdirTemp("", "mindustry-forwarder-setup-lo-*")
+	if err != nil {
+		log.Printf("setup-lo: cannot create temp dir: %v", err)
+		return 1
+	}
+	defer os.RemoveAll(dir)
+
+	scriptPath := filepath.Join(dir, "setup-lo-transparent.sh")
+	if err := os.WriteFile(scriptPath, setupLoTransparentScript, 0o700); err != nil {
+		log.Printf("setup-lo: cannot write embedded script: %v", err)
+		return 1
+	}
+
+	argv := []string{scriptPath}
+	if undo {
+		argv = append(argv, "--undo", aliasIP)
+	} else {
+		argv = append(argv, aliasIP)
+	}
+
+	cmd := exec.Command("/usr/bin/env", append([]string{"bash"}, argv...)...)
+	if quiet {
+		cmd.Env = append(os.Environ(), "MINDUSTRY_SETUP_LO_QUIET=1")
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		log.Printf("setup-lo failed: %v", err)
+		return 1
+	}
+	return 0
+}
+
+func undo_lo_alias() {
+	if loAliasActive == "" {
+		return
+	}
+	ip := loAliasActive
+	loAliasActive = ""
+	code := run_embedded_setup_lo(true, ip, true)
+	if code != 0 {
+		log.Printf("setup-lo undo failed (exit %d) for %s", code, ip)
+		return
+	}
+	log.Printf("setup-lo: removed lo alias %s", ip)
+}
+
+// maybe_auto_setup_lo: when backend is 127/8 and transparent is desired,
+// add a non-127 alias on lo and rewrite backend_addr to that alias so
+// IP_TRANSPARENT can work. Returns the (possibly rewritten) backend addr.
+func maybe_auto_setup_lo(backend_addr string) string {
+	if args.NoTransparent || args.NoAutoSetupLo {
+		return backend_addr
+	}
+	if !backend_host_is_loopback(backend_addr) {
+		return backend_addr
+	}
+
+	_, port, err := net.SplitHostPort(backend_addr)
+	if err != nil {
+		return backend_addr
+	}
+
+	alias := args.SetupLoIP
+	if alias == "" {
+		alias = "172.31.255.1"
+	}
+	if ip := net.ParseIP(alias); ip == nil || ip.IsLoopback() {
+		log.Fatalf("invalid --setup-lo-ip %q (must be a non-127 IP)", alias)
+	}
+
+	log.Printf("setup-lo: backend is 127/8 — configuring lo alias %s (auto)", alias)
+	code := run_embedded_setup_lo(false, alias, false)
+	if code != 0 {
+		log.Fatalf("setup-lo failed (exit %d); re-run as root, or use --no-auto-setup-lo / --no-transparent", code)
+	}
+	loAliasActive = alias
+
+	rewritten := net.JoinHostPort(alias, port)
+	log.Printf("setup-lo: mindustry backend rewritten %s -> %s", backend_addr, rewritten)
+	return rewritten
+}
+
 func main() {
 	log.SetFlags(log.Flags() | log.LUTC)
-	log.SetPrefix("[Mindustry Forwarder] UTC::")
+	log.SetPrefix("[Mindustry Forwarder Server] UTC::")
 
 	arg.MustParse(&args)
 
@@ -355,10 +536,17 @@ func main() {
 	if args.MindustryPortOnly != 0 {
 		backend_addr = fmt.Sprintf("127.0.0.1:%d", args.MindustryPortOnly)
 	}
-	// validate host:port
 	if _, _, err := net.SplitHostPort(backend_addr); err != nil {
 		log.Fatalf("invalid --mindustry host:port %q: %v", backend_addr, err)
 	}
+
+	backend_addr = maybe_auto_setup_lo(backend_addr)
+	defer release_all_client_local_routes()
+	defer undo_lo_alias()
+
+	// undo lo alias on SIGINT / SIGTERM as well as normal return
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	listen_addr, err := net.ResolveTCPAddr("tcp", args.Listen)
 	if err != nil {
@@ -374,14 +562,20 @@ func main() {
 	tproxy := want_transparent(backend_addr)
 	log.Printf("start to listen: `%s` -> mindustry `%s` (transparent=%v)",
 		listen_addr.String(), backend_addr, tproxy)
-	if !args.NoTransparent && backend_host_is_loopback(backend_addr) {
-		log.Printf("note: backend is loopback — IP_TRANSPARENT disabled automatically; " +
-			"use -m/--mindustry <lan-ip>:6567 if you need the real client IP on the game server")
-	}
+
+	go func() {
+		sig := <-sigCh
+		log.Printf("received %v, shutting down", sig)
+		_ = listener.Close()
+	}()
 
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
+			// listener closed on signal → exit accept loop; defer undoes lo
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			log.Printf("cannot accept tcp: %v", err)
 			continue
 		}

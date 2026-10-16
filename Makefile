@@ -16,7 +16,8 @@ SHELL := /usr/bin/env bash
 BIN_DIR := bin/decoder
 DECODER_NAME := mindustry-forwarder-decoder
 DECODER_DIR := decoder
-DECODER_SRC := ./cmd/decoder_server.go
+# Build the whole cmd package so //go:embed (setup-lo script) is included.
+DECODER_PKG := ./cmd
 
 # ---- version info ---------------------------------------------------------
 
@@ -60,7 +61,7 @@ decoder-amd64:
 		go build $(GO_BUILD_FLAGS) \
 			-ldflags "$(BASE_LDFLAGS)" \
 			-o ../$(BIN_DIR)/amd64/$(DECODER_NAME) \
-			$(DECODER_SRC)
+			$(DECODER_PKG)
 	@echo "built $(BIN_DIR)/amd64/$(DECODER_NAME)"
 
 # arm64: link against glibc 2.31 via zig so the binary runs on the stick.
@@ -75,7 +76,7 @@ decoder-arm64:
 		go build $(GO_BUILD_FLAGS) \
 			-ldflags "$(BASE_LDFLAGS) -linkmode external" \
 			-o ../$(BIN_DIR)/arm64/$(DECODER_NAME) \
-			$(DECODER_SRC)
+			$(DECODER_PKG)
 	@echo "built $(BIN_DIR)/arm64/$(DECODER_NAME)"
 
 clean:
