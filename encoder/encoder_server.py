@@ -47,12 +47,17 @@ IS_TCP_MASK = 1
 IS_IPV6_MASK = 128
 
 DEFAULT_TIMEOUT = 5.0
-DEFAULT_UDP_IDLE = 60.0
+DEFAULT_UDP_IDLE = 120.0
 DEFAULT_BACKLOG = 128
 
 BUFFER_SIZE = 65535
 # UDP payload max after 2-byte length prefix on a single TCP write
 UDP_MAX_PAYLOAD = 65535
+# Max datagrams buffered while the decoder tunnel is still connecting.
+UDP_CONNECT_QUEUE = 64
+# Soft cap on queued outbound frames after the tunnel is up (drop oldest).
+UDP_OUTBOUND_QUEUE = 256
+UDP_SOCKET_BUF = 4 * 1024 * 1024
 
 IpAddr = Union[IPv4Address, IPv6Address]
 ClientKey = Tuple[str, int]
@@ -142,15 +147,41 @@ def silence_udp_connreset(sock: socket.socket) -> None:
             pass
 
 
+def tune_tcp_socket(sock: Optional[socket.socket]) -> None:
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+
+
+def tune_udp_socket(sock: Optional[socket.socket]) -> None:
+    if sock is None:
+        return
+    silence_udp_connreset(sock)
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, UDP_SOCKET_BUF)
+        except OSError:
+            pass
+
+
 async def open_tunnel(
     server_host: str,
     server_port: int,
     timeout: float,
 ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    return await asyncio.wait_for(
+    reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host=server_host, port=server_port),
         timeout=timeout,
     )
+    tune_tcp_socket(writer.get_extra_info("socket"))
+    return reader, writer
 
 
 # Connection teardown noise on Windows includes ConnectionAbortedError
@@ -330,6 +361,10 @@ async def run_tcp_server(
 
 # ---------------------------------------------------------------------------
 # UDP path — one TCP tunnel per client (ip, port), length-prefixed frames
+#
+# Critical: all tunnel writes for a session go through a single writer task
+# so concurrent datagram_received callbacks cannot interleave length-prefix
+# frames (that desyncs the decoder and kills UDP entirely).
 # ---------------------------------------------------------------------------
 
 
@@ -347,9 +382,12 @@ class UdpSession(object):
         "tunnel_reader",
         "tunnel_writer",
         "reader_task",
+        "writer_task",
+        "out_queue",
         "last_active",
         "closed",
-        "lock",
+        "starting",
+        "pending",
     )
 
     def __init__(
@@ -373,26 +411,63 @@ class UdpSession(object):
         self.tunnel_reader = None  # type: Optional[asyncio.StreamReader]
         self.tunnel_writer = None  # type: Optional[asyncio.StreamWriter]
         self.reader_task = None  # type: Optional[asyncio.Task]
+        self.writer_task = None  # type: Optional[asyncio.Task]
+        self.out_queue = asyncio.Queue(maxsize=UDP_OUTBOUND_QUEUE)
         self.last_active = time.monotonic()
         self.closed = False
-        self.lock = asyncio.Lock()
+        self.starting = False
+        self.pending = []  # type: list  # datagrams while tunnel connects
 
-    async def ensure_tunnel(self):
-        # type: () -> bool
-        if self.closed:
-            return False
-        if self.tunnel_writer is not None:
-            return True
-        async with self.lock:
-            if self.closed:
-                return False
-            if self.tunnel_writer is not None:
-                return True
+    def enqueue(self, data):
+        # type: (bytes) -> None
+        """Called from the datagram callback (same thread as the event loop)."""
+        if not data or self.closed:
+            return
+        self.last_active = time.monotonic()
+
+        if self.tunnel_writer is None:
+            # Still connecting: buffer a few packets, then start the tunnel once.
+            if len(self.pending) < UDP_CONNECT_QUEUE:
+                self.pending.append(data)
+            else:
+                # Drop oldest so the newest (often more useful) survives.
+                self.pending.pop(0)
+                self.pending.append(data)
+            if not self.starting:
+                self.starting = True
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._start())
+            return
+
+        self._queue_put(data)
+
+    def _queue_put(self, data):
+        # type: (bytes) -> None
+        try:
+            self.out_queue.put_nowait(data)
+        except asyncio.QueueFull:
             try:
-                reader, writer = await open_tunnel(self.server_host, self.server_port, self.timeout)
+                self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self.out_queue.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+
+    async def _start(self):
+        # type: () -> None
+        try:
+            if self.closed:
+                return
+            try:
+                reader, writer = await open_tunnel(
+                    self.server_host, self.server_port, self.timeout
+                )
             except (asyncio.TimeoutError, OSError) as exc:
                 logger.error("%s cannot connect to decoder: %s", self.ctx, exc)
-                return False
+                await self.close()
+                return
 
             writer.write(self.ctx.pack())
             try:
@@ -400,36 +475,63 @@ class UdpSession(object):
             except OSError as exc:
                 logger.error("%s cannot write context: %s", self.ctx, exc)
                 await close_writer(writer)
-                return False
+                await self.close()
+                return
 
             self.tunnel_reader = reader
             self.tunnel_writer = writer
+
+            # Flush packets buffered during connect (in arrival order).
+            pending = self.pending
+            self.pending = []
+            for pkt in pending:
+                self._queue_put(pkt)
+
             self.reader_task = asyncio.ensure_future(self._read_tunnel())
             self.reader_task.add_done_callback(_task_done_log)
+            self.writer_task = asyncio.ensure_future(self._write_tunnel())
+            self.writer_task.add_done_callback(_task_done_log)
             logger.info(
                 "%s UDP session opened -> %s:%s",
                 self.ctx,
                 self.server_host,
                 self.server_port,
             )
-            return True
+        finally:
+            self.starting = False
 
-    async def send_datagram(self, data):
-        # type: (bytes) -> None
-        if not data or self.closed:
-            return
-        if not await self.ensure_tunnel():
-            await self.close()
-            return
-        self.last_active = time.monotonic()
+    async def _write_tunnel(self):
+        # type: () -> None
+        """Single writer: serializes length-prefixed frames onto the tunnel."""
         writer = self.tunnel_writer
         if writer is None:
             return
         try:
-            writer.write(pack_udp_frame(data))
-            await writer.drain()
-        except (OSError, ValueError) as exc:
-            logger.error("%s UDP c2s write failed: %s", self.ctx, exc)
+            while not self.closed:
+                try:
+                    data = await asyncio.wait_for(
+                        self.out_queue.get(),
+                        timeout=self.idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    if time.monotonic() - self.last_active >= self.idle_timeout:
+                        logger.info("%s UDP session idle timeout (writer)", self.ctx)
+                        break
+                    continue
+                if data is None:
+                    break
+                try:
+                    writer.write(pack_udp_frame(data))
+                    await writer.drain()
+                except (OSError, ValueError) as exc:
+                    logger.error("%s UDP c2s write failed: %s", self.ctx, exc)
+                    break
+                self.last_active = time.monotonic()
+        except asyncio.CancelledError:
+            pass
+        except _PIPE_CONN_ERRORS as exc:
+            logger.debug("%s UDP writer closed: %s", self.ctx, exc)
+        finally:
             await self.close()
 
     async def _read_tunnel(self):
@@ -447,7 +549,7 @@ class UdpSession(object):
                     )
                 except asyncio.TimeoutError:
                     if time.monotonic() - self.last_active >= self.idle_timeout:
-                        logger.info("%s UDP session idle timeout", self.ctx)
+                        logger.info("%s UDP session idle timeout (reader)", self.ctx)
                         break
                     continue
                 except asyncio.IncompleteReadError as exc:
@@ -466,8 +568,9 @@ class UdpSession(object):
                 try:
                     self.transport.sendto(payload, addr)
                 except OSError as exc:
-                    logger.error("%s UDP s2c send failed: %s", self.ctx, exc)
-                    break
+                    # Windows may raise 10054 here; keep the session unless fatal.
+                    logger.debug("%s UDP s2c send failed: %s", self.ctx, exc)
+                    continue
         except asyncio.CancelledError:
             pass
         except _PIPE_CONN_ERRORS as exc:
@@ -480,15 +583,25 @@ class UdpSession(object):
         if self.closed:
             return
         self.closed = True
-        task = self.reader_task
-        self.reader_task = None
+        self.pending = []
+        # Unblock writer waiting on queue
+        try:
+            self.out_queue.put_nowait(None)
+        except Exception:
+            pass
+
         current = asyncio.current_task() if hasattr(asyncio, "current_task") else None
-        if task is not None and task is not current and not task.done():
+        for task in (self.reader_task, self.writer_task):
+            if task is None or task is current or task.done():
+                continue
             task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        self.reader_task = None
+        self.writer_task = None
+
         writer = self.tunnel_writer
         self.tunnel_writer = None
         self.tunnel_reader = None
@@ -513,15 +626,14 @@ class UdpRelayProtocol(asyncio.DatagramProtocol):
         self.transport = transport  # type: ignore[assignment]
         self._loop = asyncio.get_event_loop()
         sock = transport.get_extra_info("socket")
-        if sock is not None:
-            silence_udp_connreset(sock)
+        tune_udp_socket(sock)
         sockname = transport.get_extra_info("sockname")
         logger.info("start to listen UDP: `%s`", sockname)
         self._reaper_task = self._loop.create_task(self._reap_idle())
 
     def datagram_received(self, data, addr):
         # type: (bytes, tuple) -> None
-        if self.transport is None or not data or self._loop is None:
+        if self.transport is None or not data:
             return
 
         host = normalize_peer_host(addr[0])
@@ -542,18 +654,13 @@ class UdpRelayProtocol(asyncio.DatagramProtocol):
             )
             self.sessions[key] = session
 
-        self._loop.create_task(self._handle_datagram(session, data))
-
-    async def _handle_datagram(self, session, data):
-        # type: (UdpSession, bytes) -> None
-        await session.send_datagram(data)
-        if session.closed:
-            self.sessions.pop(session.key, None)
+        # Synchronous enqueue — no per-datagram task (avoids write races).
+        session.enqueue(data)
 
     def error_received(self, exc):
         # type: (Exception) -> None
         # Windows may still deliver ICMP-related errors here; keep listening.
-        logger.warning("UDP endpoint error: %s", exc)
+        logger.debug("UDP endpoint error: %s", exc)
 
     def connection_lost(self, exc):
         # type: (Optional[Exception]) -> None
@@ -639,7 +746,7 @@ async def run_udp_endpoint(
                 sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             except OSError:
                 pass
-        silence_udp_connreset(sock)
+        tune_udp_socket(sock)
         sock.bind((listen_host, listen_port))
         sock.setblocking(False)
         transport, protocol = await loop.create_datagram_endpoint(_factory, sock=sock)

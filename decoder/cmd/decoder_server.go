@@ -257,12 +257,117 @@ func bytesTrim(b []byte) string {
 	return s
 }
 
+// dial_udp_unconnected binds a UDP socket (optionally spoofing client IP:port)
+// and wraps it so Read/Write talk to backend_addr without connect().
+//
+// Why not DialUDP? Mindustry often replies from a different local IP than the
+// dial target (e.g. dial 172.31.255.1:6567, reply from 10.0.0.100:6567 when
+// the client IP is local on lo). A connected UDP socket drops those replies
+// → s2c i/o timeout → looks like total UDP loss.
+func dial_udp_unconnected(ctx *Context, backend_addr string, transparent bool) (net.Conn, string, error) {
+	raddr, err := net.ResolveUDPAddr("udp", backend_addr)
+	if err != nil {
+		return nil, "", err
+	}
+
+	network := "udp4"
+	if ctx.is_ipv6 || (raddr.IP != nil && raddr.IP.To4() == nil) {
+		network = "udp6"
+	}
+
+	var routeIP string
+	var laddr *net.UDPAddr
+	lc := net.ListenConfig{}
+
+	if transparent {
+		clientIP := ctx.ip.String()
+		if e := ensure_client_local_route(clientIP); e != nil {
+			log.Printf("%s cannot install local route for spoofed source: %v", ctx, e)
+		} else {
+			routeIP = clientIP
+		}
+		// Bind the real client port so Mindustry sees the authentic 5-tuple.
+		laddr, _ = net.ResolveUDPAddr(network, net.JoinHostPort(clientIP, fmt.Sprintf("%d", ctx.port)))
+		lc.Control = func(network, address string, c syscall.RawConn) error {
+			return set_ip_transparent(network, c)
+		}
+	}
+
+	pkt, err := lc.ListenPacket(context.Background(), network, laddrString(laddr))
+	if err != nil && transparent {
+		// Port busy or bind failed — retry with ephemeral port, still spoofing IP.
+		log.Printf("%s UDP bind %v failed (%v), retry ephemeral port", ctx, laddr, err)
+		laddr, _ = net.ResolveUDPAddr(network, net.JoinHostPort(ctx.ip.String(), "0"))
+		pkt, err = lc.ListenPacket(context.Background(), network, laddrString(laddr))
+	}
+	if err != nil {
+		release_client_local_route(routeIP)
+		return nil, "", err
+	}
+
+	uc, ok := pkt.(*net.UDPConn)
+	if !ok {
+		_ = pkt.Close()
+		release_client_local_route(routeIP)
+		return nil, "", fmt.Errorf("ListenPacket did not return *UDPConn")
+	}
+	return &udpBackendConn{conn: uc, raddr: raddr}, routeIP, nil
+}
+
+func laddrString(a *net.UDPAddr) string {
+	if a == nil {
+		return ":"
+	}
+	return a.String()
+}
+
+// udpBackendConn adapts an unconnected *UDPConn to net.Conn Read/Write
+// directed at a fixed remote (Mindustry).
+type udpBackendConn struct {
+	conn  *net.UDPConn
+	raddr *net.UDPAddr
+}
+
+func (u *udpBackendConn) Read(b []byte) (int, error) {
+	for {
+		n, _, err := u.conn.ReadFromUDP(b)
+		if err != nil {
+			return n, err
+		}
+		// Accept replies from any source (Mindustry may use a different
+		// local IP than the dial target).
+		return n, nil
+	}
+}
+
+func (u *udpBackendConn) Write(b []byte) (int, error) {
+	return u.conn.WriteToUDP(b, u.raddr)
+}
+
+func (u *udpBackendConn) Close() error                       { return u.conn.Close() }
+func (u *udpBackendConn) LocalAddr() net.Addr                { return u.conn.LocalAddr() }
+func (u *udpBackendConn) RemoteAddr() net.Addr               { return u.raddr }
+func (u *udpBackendConn) SetDeadline(t time.Time) error      { return u.conn.SetDeadline(t) }
+func (u *udpBackendConn) SetReadDeadline(t time.Time) error  { return u.conn.SetReadDeadline(t) }
+func (u *udpBackendConn) SetWriteDeadline(t time.Time) error { return u.conn.SetWriteDeadline(t) }
+
 // dial_backend returns the backend conn, whether the source IP was actually
 // spoofed (transparent), and an optional clientIP that holds a local route
 // (caller must release_client_local_route when the session ends).
 func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent bool, routeIP string, err error) {
 	network := base_network(ctx.is_tcp)
 	use_tproxy := want_transparent(backend_addr)
+
+	// UDP: always prefer unconnected socket (see dial_udp_unconnected).
+	if !ctx.is_tcp {
+		c, rip, e := dial_udp_unconnected(ctx, backend_addr, use_tproxy)
+		if e != nil && use_tproxy {
+			log.Printf("%s transparent UDP dial failed (%v), retry plain", ctx, e)
+			c2, rip2, e2 := dial_udp_unconnected(ctx, backend_addr, false)
+			return c2, false, rip2, e2
+		}
+		return c, use_tproxy && e == nil, rip, e
+	}
 
 	if !use_tproxy {
 		plain := net.Dialer{Timeout: args.Timeout}
@@ -273,23 +378,15 @@ func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent
 	clientIP := ctx.ip.String()
 	if e := ensure_client_local_route(clientIP); e != nil {
 		log.Printf("%s cannot install local route for spoofed source: %v", ctx, e)
-		// still try dial; may work if IP is already local
 	} else {
 		routeIP = clientIP
 	}
 
-	tnet := network
+	tnet := network + "4"
 	if ctx.is_ipv6 {
 		tnet = network + "6"
-	} else {
-		tnet = network + "4"
 	}
-	var local net.Addr
-	if ctx.is_tcp {
-		local, _ = net.ResolveTCPAddr(tnet, net.JoinHostPort(clientIP, "0"))
-	} else {
-		local, _ = net.ResolveUDPAddr(tnet, net.JoinHostPort(clientIP, "0"))
-	}
+	local, _ := net.ResolveTCPAddr(tnet, net.JoinHostPort(clientIP, "0"))
 
 	dialer := net.Dialer{
 		Timeout:   args.Timeout,
@@ -320,29 +417,64 @@ func copy_tcp(dst, src net.Conn, label string, session *Context) {
 	_ = dst.SetReadDeadline(time.Now())
 }
 
+func set_tcp_nodelay(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+	}
+}
+
+func tune_udp_conn(conn net.Conn) {
+	var uc *net.UDPConn
+	switch c := conn.(type) {
+	case *net.UDPConn:
+		uc = c
+	case *udpBackendConn:
+		uc = c.conn
+	}
+	if uc != nil {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
+}
+
+// write_udp_frame writes one length-prefixed frame in a single syscall when possible.
+func write_udp_frame(w net.Conn, payload []byte) error {
+	n := len(payload)
+	if n > UDP_MAX_PAYLOAD {
+		return fmt.Errorf("UDP payload too large: %d", n)
+	}
+	frame := make([]byte, UDP_FRAME_HEADER_SIZE+n)
+	binary.BigEndian.PutUint16(frame[:UDP_FRAME_HEADER_SIZE], uint16(n))
+	copy(frame[UDP_FRAME_HEADER_SIZE:], payload)
+	_, err := w.Write(frame)
+	return err
+}
+
 // relay_udp_c2s: tunnel TCP -> Mindustry UDP (length-prefixed frames)
 func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 	hdr := make([]byte, UDP_FRAME_HEADER_SIZE)
+	// Reuse a max-sized body buffer to avoid per-datagram alloc churn.
+	body := make([]byte, UDP_MAX_PAYLOAD)
 	for {
 		if _, err := io.ReadFull(tunnel, hdr); err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				log.Printf("%s UDP c2s frame header: %v", session, err)
 			}
 			return
 		}
-		length := binary.BigEndian.Uint16(hdr)
-		if int(length) > UDP_MAX_PAYLOAD {
+		length := int(binary.BigEndian.Uint16(hdr))
+		if length > UDP_MAX_PAYLOAD {
 			log.Printf("%s UDP c2s frame too large: %d", session, length)
 			return
 		}
-		buf := make([]byte, length)
 		if length > 0 {
-			if _, err := io.ReadFull(tunnel, buf); err != nil {
+			if _, err := io.ReadFull(tunnel, body[:length]); err != nil {
 				log.Printf("%s UDP c2s frame body: %v", session, err)
 				return
 			}
 		}
-		if _, err := backend.Write(buf); err != nil {
+		if _, err := backend.Write(body[:length]); err != nil {
 			log.Printf("%s UDP c2s write to Mindustry: %v", session, err)
 			return
 		}
@@ -352,7 +484,6 @@ func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 // relay_udp_s2c: Mindustry UDP -> tunnel TCP (length-prefixed frames)
 func relay_udp_s2c(tunnel net.Conn, backend net.Conn, session *Context) {
 	buf := make([]byte, UDP_MAX_PAYLOAD)
-	hdr := make([]byte, UDP_FRAME_HEADER_SIZE)
 	for {
 		n, err := backend.Read(buf)
 		if err != nil {
@@ -364,13 +495,8 @@ func relay_udp_s2c(tunnel net.Conn, backend net.Conn, session *Context) {
 		if n == 0 {
 			continue
 		}
-		binary.BigEndian.PutUint16(hdr, uint16(n))
-		if _, err := tunnel.Write(hdr); err != nil {
-			log.Printf("%s UDP s2c frame header: %v", session, err)
-			return
-		}
-		if _, err := tunnel.Write(buf[:n]); err != nil {
-			log.Printf("%s UDP s2c frame body: %v", session, err)
+		if err := write_udp_frame(tunnel, buf[:n]); err != nil {
+			log.Printf("%s UDP s2c frame: %v", session, err)
 			return
 		}
 	}
@@ -378,6 +504,7 @@ func relay_udp_s2c(tunnel net.Conn, backend net.Conn, session *Context) {
 
 func forward_handler(backend_addr string, conn *net.TCPConn) {
 	defer conn.Close()
+	set_tcp_nodelay(conn)
 
 	err := conn.SetReadDeadline(time.Now().Add(args.Timeout))
 	if err != nil {
@@ -409,6 +536,12 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 	defer backend_conn.Close()
 	defer release_client_local_route(routeIP)
 
+	if ctx.is_tcp {
+		set_tcp_nodelay(backend_conn)
+	} else {
+		tune_udp_conn(backend_conn)
+	}
+
 	mode := "plain"
 	if transparent {
 		mode = "transparent"
@@ -424,12 +557,21 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 		copy_tcp(conn, backend_conn, "Mindustry Server to Client", ctx)
 		<-done
 	} else {
-		done := make(chan struct{})
+		// Close either side when the other finishes so both relays exit.
+		done := make(chan struct{}, 2)
 		go func() {
 			relay_udp_c2s(backend_conn, conn, ctx)
-			close(done)
+			_ = backend_conn.SetReadDeadline(time.Now())
+			_ = conn.SetReadDeadline(time.Now())
+			done <- struct{}{}
 		}()
-		relay_udp_s2c(conn, backend_conn, ctx)
+		go func() {
+			relay_udp_s2c(conn, backend_conn, ctx)
+			_ = backend_conn.SetReadDeadline(time.Now())
+			_ = conn.SetReadDeadline(time.Now())
+			done <- struct{}{}
+		}()
+		<-done
 		<-done
 	}
 
