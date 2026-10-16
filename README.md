@@ -1,73 +1,136 @@
 # Mindustry Forwarder
 
-TCP/UDP tunnel that forwards Mindustry client traffic through a constrained
-path (for example a Windows host that can only reach a Linux “stick”), while
-optionally preserving the **real client source IP** on the game server via
-Linux `IP_TRANSPARENT`.
+TCP/UDP tunnel for Mindustry. Clients talk to a Python **encoder** (edge /
+Windows). The encoder opens one TCP tunnel per session to a Go **decoder**
+(Linux game host). The decoder dials the real Mindustry server and can
+preserve the **real client source IP** with Linux `IP_TRANSPARENT`.
 
 ```
-  Game clients                    Windows / edge                     Linux (game host)
- ┌────────────┐   TCP+UDP 6567   ┌─────────────────┐  TCP tunnel   ┌──────────────────┐
- │  Mindustry │ ───────────────► │ encoder_server  │ ────────────► │ decoder (Go)     │
- │  clients   │                  │ (Python 3.8+)   │   :6568       │   :6568          │
- └────────────┘                  └─────────────────┘               │        │         │
-                                                                   │  plain or        │
-                                                                   │  IP_TRANSPARENT  │
-                                                                   │        ▼         │
-                                                                   │ Mindustry :6567  │
-                                                                   └──────────────────┘
+  Game clients                 Edge host                         Linux game host
+ ┌────────────┐  TCP+UDP :6567 ┌──────────────────┐  TCP :6568  ┌─────────────────────────┐
+ │  Mindustry │ ─────────────► │ encoder_server.py│ ──────────► │ mindustry-forwarder-    │
+ │  clients   │                │ (Python 3.8+,    │  + context  │ decoder (Go)            │
+ └────────────┘                │  stdlib only)    │  header     │                         │
+                               └──────────────────┘             │  plain or IP_TRANSPARENT│
+                                                                │            │            │
+                                                                │            ▼            │
+                                                                │   Mindustry :6567       │
+                                                                └─────────────────────────┘
 ```
 
-| Component | Language | Role |
-|-----------|----------|------|
-| **Encoder** | Python 3.8+ (stdlib only) | Listens like a Mindustry server (`TCP+UDP :6567`), opens one TCP tunnel per client session to the decoder, prepends a context header with the real client address |
-| **Decoder** | Go | Accepts tunnels, dials the real Mindustry (or echo) server, optionally spoofs the client source IP |
+| Component | Path | Role |
+|-----------|------|------|
+| **Encoder** | `encoder/encoder_server.py` | Listen like Mindustry (`TCP+UDP :6567`). One TCP tunnel per client session to the decoder; first bytes = context header (real client IP/port/proto). |
+| **Decoder** | `decoder/cmd/decoder_server.go` | Accept tunnels, parse context, dial Mindustry. Optional source spoof via `IP_TRANSPARENT` + per-client `lo` local routes. |
+| **Tests** | `tests/server.py`, `tests/client.py` | TCP+UDP echo stand-in and interactive client. |
 
-Windows-friendly encoder: no third-party packages, async I/O, and
-`SIO_UDP_CONNRESET` handling so ICMP port-unreachable does not kill UDP sessions.
+Logging prefixes:
+
+- Encoder: `[Mindustry Forwarder Client] UTC::…`
+- Decoder: `[Mindustry Forwarder Server] UTC::…`
+- Session tags: `[TCP 1.2.3.4:5678]` / `[UDP 1.2.3.4:5678]`
 
 ---
 
-## Protocol
+## Wire protocol
 
-Every tunnel starts with a **context header** (big-endian), then payload.
-
-| Field | Size | Notes |
-|-------|------|--------|
-| `flags` | 1 byte | bit0 = TCP (`IS_TCP`), bit7 = IPv6 (`IS_IPV6`) |
-| `port` | 2 bytes | client source port (uint16 BE) |
-| `address` | 4 or 16 bytes | IPv4 or IPv6 |
-
-After the header:
-
-- **TCP session** — raw byte stream (no framing).
-- **UDP session** — repeated frames: `uint16 BE length` + payload  
-  (preserves datagram boundaries over TCP).
-
-Encoder and decoder must stay in sync on this layout
+All multi-byte integers are **big-endian**. Encoder and decoder must match
 (`encoder/encoder_server.py` ↔ `decoder/cmd/decoder_server.go`).
 
----
+### Context header (once per tunnel)
 
-## Build (decoder)
+Sent as the first bytes on the decoder-bound TCP connection.
 
-Requires Go. ARM64 cross-build uses [Zig](https://ziglang.org/) as a
-glibc-2.31-targeting C toolchain (path: `$HOME/tools/zig/zig`).
+| Offset | Field | Size | Description |
+|--------|-------|------|-------------|
+| 0 | `flags` | 1 | bit0 = `IS_TCP` (1), bit7 = `IS_IPV6` (128) |
+| 1 | `port` | 2 | Client source port (`uint16`) |
+| 3 | `address` | 4 or 16 | IPv4 (`ip.packed` / 4 bytes) or IPv6 (16 bytes) |
 
-```bash
-make                  # both amd64 and arm64
-make decoder-amd64    # bin/decoder/amd64/mindustry-forwarder-decoder
-make decoder-arm64    # bin/decoder/arm64/mindustry-forwarder-decoder
-make DEBUG=1 decoder-amd64
-make clean
+| `flags` | Address family | Protocol | Total header length |
+|---------|----------------|----------|---------------------|
+| `0x00` | IPv4 | UDP | 7 |
+| `0x01` | IPv4 | TCP | 7 |
+| `0x80` | IPv6 | UDP | 19 |
+| `0x81` | IPv6 | TCP | 19 |
+
+Constants (both sides):
+
+```text
+IS_TCP_MASK  = 1
+IS_IPV6_MASK = 128
 ```
 
-| Artifact | Notes |
-|----------|--------|
-| `bin/decoder/amd64/...` | `CGO_ENABLED=0`, static |
-| `bin/decoder/arm64/...` | Zig `aarch64-linux-gnu.2.31`, dynamic glibc |
+IPv4-mapped IPv6 peers (`:ffff:x.x.x.x`) are collapsed to plain IPv4 before packing.
 
-The encoder is plain Python — no build step.
+### Payload after the header
+
+| Session | Framing |
+|---------|---------|
+| **TCP** (`IS_TCP`) | Raw byte stream. No extra framing. Bidirectional `io.Copy` / asyncio pipe. |
+| **UDP** (no `IS_TCP`) | Length-prefixed datagrams on the TCP tunnel: `uint16 BE length` + `payload` (0…65535 bytes). One frame ↔ one UDP datagram toward Mindustry / the client. |
+
+```text
+UDP frame:  [ len_hi ][ len_lo ][ payload … ]
+```
+
+Decoder: each frame body → one `Write` on the backend UDP socket.  
+Encoder: each TCP-read frame → one `sendto` to the original client `(ip, port)`.
+
+---
+
+## Repository layout
+
+```text
+.
+├── Makefile                              # decoder build entry
+├── README.md
+├── LICENSE                               # BSD 3-Clause
+├── .gitignore                            # bin/, build/, .venv/, …
+│
+├── decoder/                              # Go module (server side)
+│   ├── go.mod / go.sum
+│   ├── mindustry-forwarder-decoder.service
+│   └── cmd/
+│       ├── decoder_server.go             # main + //go:embed
+│       └── setup-lo-transparent.sh       # embedded lo setup (extracted at runtime)
+│
+├── encoder/                              # Python client side (no build)
+│   └── encoder_server.py
+│
+├── tests/
+│   ├── server.py                         # TCP+UDP echo (default :6567)
+│   └── client.py                         # interactive / batch client
+│
+└── bin/decoder/                          # build output (gitignored)
+    ├── amd64/mindustry-forwarder-decoder
+    └── arm64/mindustry-forwarder-decoder
+```
+
+---
+
+## Build (decoder only)
+
+```bash
+make                  # amd64 + arm64
+make decoder-amd64    # → bin/decoder/amd64/mindustry-forwarder-decoder
+make decoder-arm64    # → bin/decoder/arm64/mindustry-forwarder-decoder
+make decoder          # both
+make DEBUG=1 decoder-amd64
+make clean            # rm -rf bin
+make help
+```
+
+| Target | Output | Linkage |
+|--------|--------|---------|
+| `decoder-amd64` | `bin/decoder/amd64/mindustry-forwarder-decoder` | `CGO_ENABLED=0`, static Linux amd64 |
+| `decoder-arm64` | `bin/decoder/arm64/mindustry-forwarder-decoder` | Zig `aarch64-linux-gnu.2.31`, `CGO_ENABLED=1`, `-linkmode external` |
+
+- Build the whole package `./cmd` so `//go:embed setup-lo-transparent.sh` is included.
+- ARM64 needs Zig at `$HOME/tools/zig/zig` (override with `ZIG=…` only if you edit the Makefile).
+- Release builds use `-trimpath -ldflags "-s -w"` plus `CommitHash` / `BuildTime`.
+
+Encoder needs no compile step:
 
 ```bash
 python3 encoder/encoder_server.py --help
@@ -77,159 +140,190 @@ python3 encoder/encoder_server.py --help
 
 ## Run
 
-### 1. Mindustry (or echo) on the Linux host
+### Ports (defaults)
+
+| Role | Default |
+|------|---------|
+| Mindustry / echo | TCP+UDP **6567** |
+| Decoder tunnel listen | TCP **6568** |
+| Encoder → decoder | TCP to decoder host **:6568** |
+| Encoder client listen | TCP+UDP **6567** |
+
+### 1. Game server (or echo) on Linux
 
 ```bash
-# real game server on 6567, or for plumbing tests:
+# real Mindustry on 6567, or:
 python3 tests/server.py -l 0.0.0.0:6567
 ```
 
-### 2. Decoder (Linux, **root** recommended)
+Bind `0.0.0.0` (or the lo alias) so transparent dials to `172.31.255.1:6567` are accepted.
 
-Default backend is `127.0.0.1:6567`. Spoofing a foreign source toward
-`127.0.0.0/8` cannot complete a TCP handshake, so when the backend is loopback
-the decoder **automatically**:
-
-1. Extracts an embedded setup script to a temp file, runs it, deletes it  
-2. Adds lo alias `172.31.255.1/32` and sysctls (`route_localnet`, `rp_filter=0`, …)  
-3. Rewrites the backend to `172.31.255.1:6567` and enables transparent mode  
-4. Per session: `ip route replace local <clientIP>/32 dev lo` so SYN-ACK/UDP
-   replies to the spoofed source stay on this host  
-5. On exit (SIGINT/SIGTERM): removes client local routes and the lo alias  
+### 2. Decoder (Linux)
 
 ```bash
-sudo ./mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
+sudo bin/decoder/amd64/mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
+# or after install:
+sudo mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
 ```
 
-Useful flags:
+#### CLI
 
-| Flag | Meaning |
-|------|---------|
-| `-l / --listen` | Tunnel listen address (default `:6568`) |
-| `-m / --mindustry` | Game server `host:port` (default `127.0.0.1:6567`) |
-| `-p / --mindustry-port` | Shorthand: `127.0.0.1:<port>` |
-| `--timeout` | Connect / header timeout (default `5s`) |
-| `--setup-lo-ip` | Lo alias IP (default `172.31.255.1`) |
-| `--no-auto-setup-lo` | Do not rewrite 127/8 backends |
-| `--no-transparent` | Never spoof client IP (plain dial only) |
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-l`, `--listen` | `:6568` | Tunnel listen `host:port` |
+| `-m`, `--mindustry` | `127.0.0.1:6567` | Backend game server |
+| `-p`, `--mindustry-port` | — | Shorthand backend `127.0.0.1:<port>` (overrides host of `-m`) |
+| `--timeout` | `5s` | Context read + dial timeout |
+| `--setup-lo-ip` | `172.31.255.1` | Lo alias when auto-setup runs |
+| `--no-auto-setup-lo` | off | Do not rewrite 127/8 backends |
+| `--no-transparent` | off | Never use `IP_TRANSPARENT` |
 
-If Mindustry already listens on a **non-loopback** address, point `-m` there
-directly (no lo rewrite needed):
+#### Auto lo setup (127/8 backends)
+
+Spoofing a foreign source toward `127.0.0.0/8` cannot finish TCP handshake
+(dial `i/o timeout`). If `-m` is loopback, transparent is desired, and
+`--no-auto-setup-lo` is not set, the decoder:
+
+1. Writes the embedded `setup-lo-transparent.sh` under a temp dir, runs it, **deletes** the temp tree  
+2. Adds `172.31.255.1/32` on `lo` and sysctls (`route_localnet`, `rp_filter=0`, `accept_local=1`, `ip_forward=1`)  
+3. Rewrites backend to `172.31.255.1:<port>` so transparent dial is allowed  
+4. **Per session**: `ip route replace local <clientIP>/32 dev lo` (refcounted) so SYN-ACK / UDP replies to the spoofed source stay on this host  
+5. On **SIGINT / SIGTERM / exit**: drop client local routes, run setup undo, remove lo alias  
+
+Needs **root** (or `CAP_NET_ADMIN`), `bash`, and `ip` (iproute2).
+
+Non-loopback backend (no rewrite):
 
 ```bash
-sudo ./mindustry-forwarder-decoder -l :6568 -m 192.168.1.10:6567
+sudo mindustry-forwarder-decoder -l :6568 -m 192.168.1.10:6567
 ```
 
-Transparent dial needs `CAP_NET_ADMIN` (typically root), `iproute2`, and a
-working `ip` binary.
+Plain only (no spoof, no auto lo):
 
-### 3. Encoder (Windows or any client-side host)
+```bash
+mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567 --no-transparent
+# or
+mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567 --no-auto-setup-lo
+```
+
+If transparent dial fails, the decoder logs the error, releases the local route,
+and **retries plain** so the session still works (source IP will be local).
+
+### 3. Encoder (Windows or Linux edge)
 
 ```bash
 python encoder_server.py -l 0.0.0.0:6567 -s <decoder-host>:6568
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `-l / --listen` | Local listen for game clients (default `0.0.0.0:6567`) |
-| `-s / --server` | Decoder host:port (default `10.22.33.1:6568`) |
-| `-t / --timeout` | Connect timeout seconds |
-| `--udp-idle` | Drop idle UDP sessions after N seconds (default `60`) |
-| `--tcp-only` / `--udp-only` | Single protocol |
-| `-v` | Debug logging |
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-l`, `--listen` | `0.0.0.0:6567` | Client-facing TCP+UDP listen |
+| `-s`, `--server` | `10.22.33.1:6568` | Decoder tunnel address |
+| `-t`, `--timeout` | `5` | Connect timeout (seconds) |
+| `--udp-idle` | `60` | Idle UDP session timeout (seconds) |
+| `--backlog` | `128` | TCP listen backlog |
+| `--tcp-only` / `--udp-only` | off | Single protocol |
+| `-v`, `--verbose` | off | Debug logging |
 
-Point Mindustry clients at the encoder host (`<encoder-ip>:6567`).
+Windows notes baked into the encoder:
 
-### systemd (optional)
+- `SIO_UDP_CONNRESET` disabled so ICMP port-unreachable does not abort UDP  
+- Connection aborts (`WinError 1236` / reset) are treated as normal pipe end  
 
-A sample unit is provided at
-`decoder/mindustry-forwarder-decoder.service`. Adjust paths and
-`User=`/`CapabilityBoundingSet=` as needed; transparent mode generally
-requires root or ambient `CAP_NET_ADMIN`.
+Point Mindustry clients at `<encoder-host>:6567`.
+
+### systemd
+
+Sample unit: `decoder/mindustry-forwarder-decoder.service`
+
+```ini
+[Unit]
+Description=mindustry-forwarder-decoder
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mindustry-forwarder-decoder
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install the binary under `/usr/local/bin/`, adjust `ExecStart` flags (`-l`, `-m`, …).
+Transparent mode generally needs root or ambient `CAP_NET_ADMIN`.
 
 ---
 
 ## Testing without Mindustry
 
 ```bash
-# Linux: echo server pretending to be Mindustry
+# Linux host
 python3 tests/server.py -l 0.0.0.0:6567
+sudo bin/decoder/amd64/mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
 
-# Linux: decoder (root for transparent)
-sudo ./mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
-
-# Client host: encoder
+# Edge host
 python3 encoder/encoder_server.py -l 0.0.0.0:6567 -s <decoder-ip>:6568
 
-# Interactive client (default target 127.0.0.1:6567 = encoder)
+# Against encoder (default) or echo/decoder directly
 python3 tests/client.py -t 127.0.0.1:6567
-```
-
-Client commands:
-
-| Input | Action |
-|-------|--------|
-| `t <msg>` / `tcp <msg>` | Send over TCP |
-| `u <msg>` / `udp <msg>` | Send over UDP |
-| bare line | Same as TCP |
-| `host` / `port` / `target` | Change destination |
-| `help` / `quit` | Help / exit |
-
-Batch mode:
-
-```bash
 python3 tests/client.py -t 127.0.0.1:6567 -c 't hello' -c 'u hello'
 ```
 
-Echo reply format:
+### `tests/server.py`
 
-```text
-TCP <ip>:<port> <content>
-UDP <ip>:<port> <content>
-```
+- Listens **TCP + UDP** on the same port (default `0.0.0.0:6567`)  
+- Reply (UTF-8, one line): `TCP <ip>:<port> <content>` / `UDP <ip>:<port> <content>`  
+- Content is stripped of surrounding whitespace  
 
-With transparent mode working, `<ip>` should be the **real client address**
-from the encoder context (not the decoder’s lo alias).
+With transparent mode working, `<ip>` is the **real client** from the context
+header (e.g. `10.0.192.101`), not `172.31.255.1`.
 
----
+### `tests/client.py`
 
-## Transparent proxy notes
+| Input | Action |
+|-------|--------|
+| `t <msg>` / `tcp <msg>` | Send via TCP (connection reused until drop) |
+| `u <msg>` / `udp <msg>` | Send via UDP |
+| bare line | Same as TCP |
+| `host` / `port` / `target` | Change destination |
+| `timeout <sec>` | Recv timeout |
+| `help` / `quit` | Help / exit |
 
-| Backend | Transparent? | What you see on the game server |
-|---------|--------------|----------------------------------|
-| `127.0.0.1:6567` without auto setup | Off (forced plain) | Local source IP |
-| `127.0.0.1:6567` with auto setup (default) | On via `172.31.255.1` + per-client local routes | Real client IP |
-| Non-loopback LAN IP | On (if permitted) | Real client IP |
-| `--no-transparent` | Always off | Local source IP |
-
-Do **not** try to rewrite TCP/UDP headers in userspace to fake the source
-address. Sequence numbers, ACKs, retransmits, and checksums make that a full
-stack rewrite. The supported path is kernel `IP_TRANSPARENT` plus local
-routes on `lo` when the host has no other NIC.
-
-If transparent dial fails, the decoder logs the error and **retries plain**
-so the session still works (source IP will then be wrong).
+| Flag | Default |
+|------|---------|
+| `-t`, `--target` | `127.0.0.1:6567` |
+| `--timeout` | `3` |
+| `-c`, `--command` | repeatable; batch then exit |
 
 ---
 
-## Layout
+## Transparent proxy matrix
 
-```text
-.
-├── Makefile
-├── README.md
-├── decoder/
-│   ├── cmd/
-│   │   ├── decoder_server.go          # main
-│   │   └── setup-lo-transparent.sh    # embedded via //go:embed
-│   ├── go.mod
-│   └── mindustry-forwarder-decoder.service
-├── encoder/
-│   └── encoder_server.py
-└── tests/
-    ├── client.py                      # interactive TCP/UDP client
-    └── server.py                      # TCP+UDP echo server
-```
+| Backend | Auto lo | Transparent dial | Source IP on game server |
+|---------|---------|------------------|---------------------------|
+| `127.0.0.1:6567` (default) | yes | yes → `172.31.255.1:6567` + client local routes | Real client IP |
+| `127.0.0.1:6567` + `--no-auto-setup-lo` | no | forced **plain** (127/8) | Decoder local IP |
+| Non-loopback LAN IP | n/a | yes (if permitted) | Real client IP |
+| `--no-transparent` | skipped | always plain | Decoder local IP |
+
+Do **not** rewrite TCP/UDP headers in userspace to fake the source address.
+That requires owning sequence numbers, ACKs, retransmits, and checksums (a
+full stack). The supported path is kernel `IP_TRANSPARENT` plus
+`ip route local <client>/32 dev lo` when the host is lo-only.
+
+---
+
+## Session model
+
+| Path | Encoder | Decoder |
+|------|---------|---------|
+| TCP | One tunnel TCP connection per accepted client TCP | Parse context → dial backend TCP (optionally spoofed) → bidirectional copy |
+| UDP | One tunnel TCP connection per client `(ip, port)`; idle reap | Parse context → dial backend UDP → length-prefixed frames both ways |
+
+UDP idle sessions are closed after `--udp-idle` seconds without traffic.
+Decoder clears header read deadline after the context is parsed so long game
+sessions are not cut by the initial timeout.
 
 ---
 
@@ -237,12 +331,13 @@ so the session still works (source IP will then be wrong).
 
 | Side | Needs |
 |------|--------|
-| Encoder | Python 3.8+ (3.8–3.x), Windows or Linux, stdlib only |
-| Decoder | Linux, root (or `CAP_NET_ADMIN`) for transparent mode, `bash`, `ip` |
-| Build | Go toolchain; Zig at `$HOME/tools/zig/zig` for arm64 |
+| **Encoder** | Python **3.8+**, Windows x64 or Linux, **stdlib only** (asyncio, socket, struct, …) |
+| **Decoder runtime** | Linux; root / `CAP_NET_ADMIN` for transparent; `bash`; `ip` (iproute2) |
+| **Decoder build** | Go toolchain; for arm64: Zig at `$HOME/tools/zig/zig` targeting `aarch64-linux-gnu.2.31` |
+| **Tests** | Same Python as encoder |
 
 ---
 
-## License / status
+## License
 
-Internal tooling for wifi-stick / lab use. No warranty.
+BSD 3-Clause. See [LICENSE](LICENSE).
