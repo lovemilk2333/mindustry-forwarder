@@ -22,38 +22,48 @@ import (
 )
 
 //go:embed setup-lo-transparent.sh
-var setupLoTransparentScript []byte
+var setup_lo_transparent_script []byte
 
-const MIN_CONTEXT_LENGTH = 1 + 2 // flags (int8) + port (uint16 BE)
-const IPV4_LENGTH = 4            // 32 bit = 4 Byte
-const IPV6_LENGTH = 16           // 128 bit = 16 Byte
-
-const IS_TCP_MASK = 1
-const IS_IPV6_MASK = 128
-
-// UDP over the TCP tunnel is length-prefixed: uint16 BE length + payload.
-// Must stay in sync with encoder/encoder_server.py.
-const UDP_FRAME_HEADER_SIZE = 2
-const UDP_MAX_PAYLOAD = 65535
+// Protocol constants (shared with encoder/encoder_server.py).
+const (
+	min_context_length    = 1 + 2 // flags + port (uint16 BE)
+	ipv4_length           = 4
+	ipv6_length           = 16
+	is_tcp_mask           = 1
+	is_ipv6_mask          = 128
+	udp_frame_header_size = 2
+	udp_max_payload       = 65535
+)
 
 // Linux: IPV6_TRANSPARENT is not in older x/sys snapshots used by some Go toolchains.
-const ipv6Transparent = 75 // include/uapi/linux/in6.h IPV6_TRANSPARENT
+const ipv6_transparent = 75 // include/uapi/linux/in6.h IPV6_TRANSPARENT
 
+// Context is the per-tunnel client description parsed from the encoder header.
+// Exported name so logs / fmt treat it as a first-class type; fields are private.
 type Context struct {
 	ip      netip.Addr
 	is_ipv6 bool
 	is_tcp  bool
 	port    uint16
+
+	_cached_string string
 }
 
-func (this *Context) String() string {
+func (this *Context) init() *Context {
 	proto := "UDP"
 	if this.is_tcp {
 		proto = "TCP"
 	}
-	return fmt.Sprintf("[%s %s:%d]", proto, this.ip.String(), this.port)
+	this._cached_string = fmt.Sprintf("[%s %s:%d]", proto, this.ip.String(), this.port)
+	return this
 }
 
+// String implements fmt.Stringer (exported interface method).
+func (this *Context) String() string {
+	return this._cached_string
+}
+
+// CLI flags — field names must be PascalCase for go-arg reflection.
 var args struct {
 	Listen            string        `arg:"-l,--listen" default:":6568" help:"TCP tunnel listen host and port"`
 	Mindustry         string        `arg:"-m,--mindustry" default:"127.0.0.1:6567" help:"Mindustry server host:port"`
@@ -65,62 +75,62 @@ var args struct {
 }
 
 // set when auto setup-lo succeeded; cleared by undo on exit.
-var loAliasActive string
+var lo_alias_active string
 
-// client IPs we installed as `ip route local … dev lo` so SYN-ACK/UDP
-// replies to the spoofed source stay on this host. Refcounted per session.
+// client IPs installed as `ip route local … dev lo` so SYN-ACK/UDP replies
+// to the spoofed source stay on this host. Refcounted per session.
 var (
-	localRouteMu   sync.Mutex
-	localRouteRefs = map[string]int{}
+	local_route_mu   sync.Mutex
+	local_route_refs = map[string]int{}
 )
 
 func parse_context(data []byte) (int, *Context, error) {
 	length := len(data)
-	if length < MIN_CONTEXT_LENGTH {
+	if length < min_context_length {
 		return 0, nil, errors.New("context too short")
 	}
 
 	used_length := 0
 	flags := data[0]
-	is_ipv6 := flags&IS_IPV6_MASK == IS_IPV6_MASK
-	is_tcp := flags&IS_TCP_MASK == IS_TCP_MASK
+	is_ipv6 := flags&is_ipv6_mask == is_ipv6_mask
+	is_tcp := flags&is_tcp_mask == is_tcp_mask
 	port := (uint16(data[1]) << 8) | uint16(data[2])
 
 	var ip netip.Addr
 	if is_ipv6 {
-		if length < MIN_CONTEXT_LENGTH+IPV6_LENGTH {
+		if length < min_context_length+ipv6_length {
 			return 0, nil, errors.New("context too short")
 		}
-		ip = netip.AddrFrom16([IPV6_LENGTH]byte(data[3 : 3+IPV6_LENGTH]))
-		used_length = MIN_CONTEXT_LENGTH + IPV6_LENGTH
+		ip = netip.AddrFrom16([ipv6_length]byte(data[3 : 3+ipv6_length]))
+		used_length = min_context_length + ipv6_length
 	} else {
-		if length < MIN_CONTEXT_LENGTH+IPV4_LENGTH {
+		if length < min_context_length+ipv4_length {
 			return 0, nil, errors.New("context too short")
 		}
-		ip = netip.AddrFrom4([IPV4_LENGTH]byte(data[3 : 3+IPV4_LENGTH]))
-		used_length = MIN_CONTEXT_LENGTH + IPV4_LENGTH
+		ip = netip.AddrFrom4([ipv4_length]byte(data[3 : 3+ipv4_length]))
+		used_length = min_context_length + ipv4_length
 	}
 
-	return used_length, &Context{
+	return used_length, (&Context{
 		ip:      ip,
 		is_ipv6: is_ipv6,
 		is_tcp:  is_tcp,
 		port:    port,
-	}, nil
+	}).init(), nil
 }
 
 // read_context reads a variable-length context header from conn.
 func read_context(conn net.Conn) (*Context, error) {
-	head := make([]byte, MIN_CONTEXT_LENGTH)
+	head := make([]byte, min_context_length)
 	if _, err := io.ReadFull(conn, head); err != nil {
 		return nil, err
 	}
 
 	flags := head[0]
-	is_ipv6 := flags&IS_IPV6_MASK == IS_IPV6_MASK
-	addr_len := IPV4_LENGTH
+	is_ipv6 := flags&is_ipv6_mask == is_ipv6_mask
+	addr_len := ipv4_length
 	if is_ipv6 {
-		addr_len = IPV6_LENGTH
+		addr_len = ipv6_length
 	}
 
 	addr := make([]byte, addr_len)
@@ -139,7 +149,6 @@ func backend_host_is_loopback(backend_addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// hostname — resolve best-effort
 		ips, err := net.LookupIP(host)
 		if err != nil || len(ips) == 0 {
 			return false
@@ -166,13 +175,11 @@ func set_ip_transparent(network string, c syscall.RawConn) error {
 	var dial_err error
 	err := c.Control(func(fd uintptr) {
 		f := int(fd)
-		// IPv4 transparent (also needed for dual-stack sockets in many setups)
 		if e := syscall.SetsockoptInt(f, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); e != nil {
-			// not fatal alone on pure IPv6 sockets; record and try IPv6
 			dial_err = e
 		}
 		if network == "tcp6" || network == "udp6" {
-			if e := syscall.SetsockoptInt(f, syscall.IPPROTO_IPV6, ipv6Transparent, 1); e != nil {
+			if e := syscall.SetsockoptInt(f, syscall.IPPROTO_IPV6, ipv6_transparent, 1); e != nil {
 				dial_err = e
 			} else {
 				dial_err = nil
@@ -196,60 +203,59 @@ func base_network(is_tcp bool) string {
 	return "udp"
 }
 
-// ensure_client_local_route makes the kernel treat clientIP as a local
+// ensure_client_local_route makes the kernel treat client_ip as a local
 // address on lo. Without this, SYN-ACK/UDP replies to the spoofed source
 // are routed off-box and the transparent handshake times out.
-func ensure_client_local_route(clientIP string) error {
-	localRouteMu.Lock()
-	defer localRouteMu.Unlock()
-	if localRouteRefs[clientIP] > 0 {
-		localRouteRefs[clientIP]++
+func ensure_client_local_route(client_ip string) error {
+	local_route_mu.Lock()
+	defer local_route_mu.Unlock()
+	if local_route_refs[client_ip] > 0 {
+		local_route_refs[client_ip]++
 		return nil
 	}
-	// `ip route replace local <ip>/32 dev lo` — idempotent, needs root.
-	cmd := exec.Command("ip", "route", "replace", "local", clientIP+"/32", "dev", "lo")
+	cmd := exec.Command("ip", "route", "replace", "local", client_ip+"/32", "dev", "lo")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ip route replace local %s/32 dev lo: %v (%s)", clientIP, err, bytesTrim(out))
+		return fmt.Errorf("ip route replace local %s/32 dev lo: %v (%s)", client_ip, err, bytes_trim(out))
 	}
-	localRouteRefs[clientIP] = 1
+	local_route_refs[client_ip] = 1
 	return nil
 }
 
-func release_client_local_route(clientIP string) {
-	if clientIP == "" {
+func release_client_local_route(client_ip string) {
+	if client_ip == "" {
 		return
 	}
-	localRouteMu.Lock()
-	defer localRouteMu.Unlock()
-	n := localRouteRefs[clientIP]
+	local_route_mu.Lock()
+	defer local_route_mu.Unlock()
+	n := local_route_refs[client_ip]
 	if n <= 0 {
 		return
 	}
 	if n > 1 {
-		localRouteRefs[clientIP] = n - 1
+		local_route_refs[client_ip] = n - 1
 		return
 	}
-	delete(localRouteRefs, clientIP)
-	cmd := exec.Command("ip", "route", "del", "local", clientIP+"/32", "dev", "lo")
-	_ = cmd.Run() // best-effort; may already be gone
+	delete(local_route_refs, client_ip)
+	cmd := exec.Command("ip", "route", "del", "local", client_ip+"/32", "dev", "lo")
+	_ = cmd.Run()
 }
 
 func release_all_client_local_routes() {
-	localRouteMu.Lock()
-	ips := make([]string, 0, len(localRouteRefs))
-	for ip := range localRouteRefs {
+	local_route_mu.Lock()
+	ips := make([]string, 0, len(local_route_refs))
+	for ip := range local_route_refs {
 		ips = append(ips, ip)
 	}
-	localRouteRefs = map[string]int{}
-	localRouteMu.Unlock()
+	local_route_refs = map[string]int{}
+	local_route_mu.Unlock()
 	for _, ip := range ips {
 		cmd := exec.Command("ip", "route", "del", "local", ip+"/32", "dev", "lo")
 		_ = cmd.Run()
 	}
 }
 
-func bytesTrim(b []byte) string {
+func bytes_trim(b []byte) string {
 	s := string(b)
 	if len(s) > 200 {
 		return s[:200]
@@ -261,9 +267,8 @@ func bytesTrim(b []byte) string {
 // and wraps it so Read/Write talk to backend_addr without connect().
 //
 // Why not DialUDP? Mindustry often replies from a different local IP than the
-// dial target (e.g. dial 172.31.255.1:6567, reply from 10.0.0.100:6567 when
-// the client IP is local on lo). A connected UDP socket drops those replies
-// → s2c i/o timeout → looks like total UDP loss.
+// dial target (e.g. dial 172.31.255.1:6567, reply from 10.0.0.100:6567). A
+// connected UDP socket drops those replies → s2c i/o timeout.
 func dial_udp_unconnected(ctx *Context, backend_addr string, transparent bool) (net.Conn, string, error) {
 	raddr, err := net.ResolveUDPAddr("udp", backend_addr)
 	if err != nil {
@@ -275,90 +280,84 @@ func dial_udp_unconnected(ctx *Context, backend_addr string, transparent bool) (
 		network = "udp6"
 	}
 
-	var routeIP string
+	var route_ip string
 	var laddr *net.UDPAddr
 	lc := net.ListenConfig{}
 
 	if transparent {
-		clientIP := ctx.ip.String()
-		if e := ensure_client_local_route(clientIP); e != nil {
+		client_ip := ctx.ip.String()
+		if e := ensure_client_local_route(client_ip); e != nil {
 			log.Printf("%s cannot install local route for spoofed source: %v", ctx, e)
 		} else {
-			routeIP = clientIP
+			route_ip = client_ip
 		}
-		// Bind the real client port so Mindustry sees the authentic 5-tuple.
-		laddr, _ = net.ResolveUDPAddr(network, net.JoinHostPort(clientIP, fmt.Sprintf("%d", ctx.port)))
+		laddr, _ = net.ResolveUDPAddr(network, net.JoinHostPort(client_ip, fmt.Sprintf("%d", ctx.port)))
 		lc.Control = func(network, address string, c syscall.RawConn) error {
 			return set_ip_transparent(network, c)
 		}
 	}
 
-	pkt, err := lc.ListenPacket(context.Background(), network, laddrString(laddr))
+	pkt, err := lc.ListenPacket(context.Background(), network, laddr_string(laddr))
 	if err != nil && transparent {
-		// Port busy or bind failed — retry with ephemeral port, still spoofing IP.
 		log.Printf("%s UDP bind %v failed (%v), retry ephemeral port", ctx, laddr, err)
 		laddr, _ = net.ResolveUDPAddr(network, net.JoinHostPort(ctx.ip.String(), "0"))
-		pkt, err = lc.ListenPacket(context.Background(), network, laddrString(laddr))
+		pkt, err = lc.ListenPacket(context.Background(), network, laddr_string(laddr))
 	}
 	if err != nil {
-		release_client_local_route(routeIP)
+		release_client_local_route(route_ip)
 		return nil, "", err
 	}
 
 	uc, ok := pkt.(*net.UDPConn)
 	if !ok {
 		_ = pkt.Close()
-		release_client_local_route(routeIP)
+		release_client_local_route(route_ip)
 		return nil, "", fmt.Errorf("ListenPacket did not return *UDPConn")
 	}
-	return &udpBackendConn{conn: uc, raddr: raddr}, routeIP, nil
+	return &udp_backend_conn{conn: uc, raddr: raddr}, route_ip, nil
 }
 
-func laddrString(a *net.UDPAddr) string {
+func laddr_string(a *net.UDPAddr) string {
 	if a == nil {
 		return ":"
 	}
 	return a.String()
 }
 
-// udpBackendConn adapts an unconnected *UDPConn to net.Conn Read/Write
-// directed at a fixed remote (Mindustry).
-type udpBackendConn struct {
+// udp_backend_conn adapts an unconnected *UDPConn to net.Conn Read/Write
+// directed at a fixed remote (Mindustry). Exported methods satisfy net.Conn.
+type udp_backend_conn struct {
 	conn  *net.UDPConn
 	raddr *net.UDPAddr
 }
 
-func (u *udpBackendConn) Read(b []byte) (int, error) {
+func (u *udp_backend_conn) Read(b []byte) (int, error) {
 	for {
 		n, _, err := u.conn.ReadFromUDP(b)
 		if err != nil {
 			return n, err
 		}
-		// Accept replies from any source (Mindustry may use a different
-		// local IP than the dial target).
 		return n, nil
 	}
 }
 
-func (u *udpBackendConn) Write(b []byte) (int, error) {
+func (u *udp_backend_conn) Write(b []byte) (int, error) {
 	return u.conn.WriteToUDP(b, u.raddr)
 }
 
-func (u *udpBackendConn) Close() error                       { return u.conn.Close() }
-func (u *udpBackendConn) LocalAddr() net.Addr                { return u.conn.LocalAddr() }
-func (u *udpBackendConn) RemoteAddr() net.Addr               { return u.raddr }
-func (u *udpBackendConn) SetDeadline(t time.Time) error      { return u.conn.SetDeadline(t) }
-func (u *udpBackendConn) SetReadDeadline(t time.Time) error  { return u.conn.SetReadDeadline(t) }
-func (u *udpBackendConn) SetWriteDeadline(t time.Time) error { return u.conn.SetWriteDeadline(t) }
+func (u *udp_backend_conn) Close() error                       { return u.conn.Close() }
+func (u *udp_backend_conn) LocalAddr() net.Addr                { return u.conn.LocalAddr() }
+func (u *udp_backend_conn) RemoteAddr() net.Addr               { return u.raddr }
+func (u *udp_backend_conn) SetDeadline(t time.Time) error      { return u.conn.SetDeadline(t) }
+func (u *udp_backend_conn) SetReadDeadline(t time.Time) error  { return u.conn.SetReadDeadline(t) }
+func (u *udp_backend_conn) SetWriteDeadline(t time.Time) error { return u.conn.SetWriteDeadline(t) }
 
-// dial_backend returns the backend conn, whether the source IP was actually
-// spoofed (transparent), and an optional clientIP that holds a local route
-// (caller must release_client_local_route when the session ends).
-func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent bool, routeIP string, err error) {
+// dial_backend returns the backend conn, whether the source was spoofed, and
+// an optional client IP holding a local route (caller must release it).
+func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent bool, route_ip string, err error) {
 	network := base_network(ctx.is_tcp)
 	use_tproxy := want_transparent(backend_addr)
 
-	// UDP: always prefer unconnected socket (see dial_udp_unconnected).
 	if !ctx.is_tcp {
 		c, rip, e := dial_udp_unconnected(ctx, backend_addr, use_tproxy)
 		if e != nil && use_tproxy {
@@ -375,18 +374,18 @@ func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent
 		return c, false, "", e
 	}
 
-	clientIP := ctx.ip.String()
-	if e := ensure_client_local_route(clientIP); e != nil {
+	client_ip := ctx.ip.String()
+	if e := ensure_client_local_route(client_ip); e != nil {
 		log.Printf("%s cannot install local route for spoofed source: %v", ctx, e)
 	} else {
-		routeIP = clientIP
+		route_ip = client_ip
 	}
 
 	tnet := network + "4"
 	if ctx.is_ipv6 {
 		tnet = network + "6"
 	}
-	local, _ := net.ResolveTCPAddr(tnet, net.JoinHostPort(clientIP, "0"))
+	local, _ := net.ResolveTCPAddr(tnet, net.JoinHostPort(client_ip, "0"))
 
 	dialer := net.Dialer{
 		Timeout:   args.Timeout,
@@ -399,13 +398,13 @@ func dial_backend(ctx *Context, backend_addr string) (conn net.Conn, transparent
 	c, e := dialer.DialContext(context.Background(), tnet, backend_addr)
 	if e != nil {
 		log.Printf("%s transparent dial failed (%v), retry without IP_TRANSPARENT", ctx, e)
-		release_client_local_route(routeIP)
-		routeIP = ""
+		release_client_local_route(route_ip)
+		route_ip = ""
 		plain := net.Dialer{Timeout: args.Timeout}
 		c2, e2 := plain.DialContext(context.Background(), network, backend_addr)
 		return c2, false, "", e2
 	}
-	return c, true, routeIP, nil
+	return c, true, route_ip, nil
 }
 
 func copy_tcp(dst, src net.Conn, label string, session *Context) {
@@ -413,7 +412,6 @@ func copy_tcp(dst, src net.Conn, label string, session *Context) {
 	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 		log.Printf("%s %s unexpectedly closed: %v", session, label, err)
 	}
-	// unblock the peer direction
 	_ = dst.SetReadDeadline(time.Now())
 }
 
@@ -429,7 +427,7 @@ func tune_udp_conn(conn net.Conn) {
 	switch c := conn.(type) {
 	case *net.UDPConn:
 		uc = c
-	case *udpBackendConn:
+	case *udp_backend_conn:
 		uc = c.conn
 	}
 	if uc != nil {
@@ -441,21 +439,20 @@ func tune_udp_conn(conn net.Conn) {
 // write_udp_frame writes one length-prefixed frame in a single syscall when possible.
 func write_udp_frame(w net.Conn, payload []byte) error {
 	n := len(payload)
-	if n > UDP_MAX_PAYLOAD {
+	if n > udp_max_payload {
 		return fmt.Errorf("UDP payload too large: %d", n)
 	}
-	frame := make([]byte, UDP_FRAME_HEADER_SIZE+n)
-	binary.BigEndian.PutUint16(frame[:UDP_FRAME_HEADER_SIZE], uint16(n))
-	copy(frame[UDP_FRAME_HEADER_SIZE:], payload)
+	frame := make([]byte, udp_frame_header_size+n)
+	binary.BigEndian.PutUint16(frame[:udp_frame_header_size], uint16(n))
+	copy(frame[udp_frame_header_size:], payload)
 	_, err := w.Write(frame)
 	return err
 }
 
 // relay_udp_c2s: tunnel TCP -> Mindustry UDP (length-prefixed frames)
 func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
-	hdr := make([]byte, UDP_FRAME_HEADER_SIZE)
-	// Reuse a max-sized body buffer to avoid per-datagram alloc churn.
-	body := make([]byte, UDP_MAX_PAYLOAD)
+	hdr := make([]byte, udp_frame_header_size)
+	body := make([]byte, udp_max_payload)
 	for {
 		if _, err := io.ReadFull(tunnel, hdr); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -464,7 +461,7 @@ func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 			return
 		}
 		length := int(binary.BigEndian.Uint16(hdr))
-		if length > UDP_MAX_PAYLOAD {
+		if length > udp_max_payload {
 			log.Printf("%s UDP c2s frame too large: %d", session, length)
 			return
 		}
@@ -483,7 +480,7 @@ func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 
 // relay_udp_s2c: Mindustry UDP -> tunnel TCP (length-prefixed frames)
 func relay_udp_s2c(tunnel net.Conn, backend net.Conn, session *Context) {
-	buf := make([]byte, UDP_MAX_PAYLOAD)
+	buf := make([]byte, udp_max_payload)
 	for {
 		n, err := backend.Read(buf)
 		if err != nil {
@@ -525,16 +522,15 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 		}
 		return
 	}
-	// clear header deadline for the rest of the session
 	_ = conn.SetReadDeadline(time.Time{})
 
-	backend_conn, transparent, routeIP, err := dial_backend(ctx, backend_addr)
+	backend_conn, transparent, route_ip, err := dial_backend(ctx, backend_addr)
 	if err != nil {
 		log.Printf("%s cannot connect to Mindustry Server: %v", ctx, err)
 		return
 	}
 	defer backend_conn.Close()
-	defer release_client_local_route(routeIP)
+	defer release_client_local_route(route_ip)
 
 	if ctx.is_tcp {
 		set_tcp_nodelay(backend_conn)
@@ -557,7 +553,6 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 		copy_tcp(conn, backend_conn, "Mindustry Server to Client", ctx)
 		<-done
 	} else {
-		// Close either side when the other finishes so both relays exit.
 		done := make(chan struct{}, 2)
 		go func() {
 			relay_udp_c2s(backend_conn, conn, ctx)
@@ -580,7 +575,7 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 
 // run_embedded_setup_lo extracts the embedded script to a temp file, runs it,
 // then deletes the temp tree (use-once). Returns the script exit code.
-func run_embedded_setup_lo(undo bool, aliasIP string, quiet bool) int {
+func run_embedded_setup_lo(undo bool, alias_ip string, quiet bool) int {
 	dir, err := os.MkdirTemp("", "mindustry-forwarder-setup-lo-*")
 	if err != nil {
 		log.Printf("setup-lo: cannot create temp dir: %v", err)
@@ -588,17 +583,17 @@ func run_embedded_setup_lo(undo bool, aliasIP string, quiet bool) int {
 	}
 	defer os.RemoveAll(dir)
 
-	scriptPath := filepath.Join(dir, "setup-lo-transparent.sh")
-	if err := os.WriteFile(scriptPath, setupLoTransparentScript, 0o700); err != nil {
+	script_path := filepath.Join(dir, "setup-lo-transparent.sh")
+	if err := os.WriteFile(script_path, setup_lo_transparent_script, 0o700); err != nil {
 		log.Printf("setup-lo: cannot write embedded script: %v", err)
 		return 1
 	}
 
-	argv := []string{scriptPath}
+	argv := []string{script_path}
 	if undo {
-		argv = append(argv, "--undo", aliasIP)
+		argv = append(argv, "--undo", alias_ip)
 	} else {
-		argv = append(argv, aliasIP)
+		argv = append(argv, alias_ip)
 	}
 
 	cmd := exec.Command("/usr/bin/env", append([]string{"bash"}, argv...)...)
@@ -619,11 +614,11 @@ func run_embedded_setup_lo(undo bool, aliasIP string, quiet bool) int {
 }
 
 func undo_lo_alias() {
-	if loAliasActive == "" {
+	if lo_alias_active == "" {
 		return
 	}
-	ip := loAliasActive
-	loAliasActive = ""
+	ip := lo_alias_active
+	lo_alias_active = ""
 	code := run_embedded_setup_lo(true, ip, true)
 	if code != 0 {
 		log.Printf("setup-lo undo failed (exit %d) for %s", code, ip)
@@ -633,8 +628,7 @@ func undo_lo_alias() {
 }
 
 // maybe_auto_setup_lo: when backend is 127/8 and transparent is desired,
-// add a non-127 alias on lo and rewrite backend_addr to that alias so
-// IP_TRANSPARENT can work. Returns the (possibly rewritten) backend addr.
+// add a non-127 alias on lo and rewrite backend_addr to that alias.
 func maybe_auto_setup_lo(backend_addr string) string {
 	if args.NoTransparent || args.NoAutoSetupLo {
 		return backend_addr
@@ -661,7 +655,7 @@ func maybe_auto_setup_lo(backend_addr string) string {
 	if code != 0 {
 		log.Fatalf("setup-lo failed (exit %d); re-run as root, or use --no-auto-setup-lo / --no-transparent", code)
 	}
-	loAliasActive = alias
+	lo_alias_active = alias
 
 	rewritten := net.JoinHostPort(alias, port)
 	log.Printf("setup-lo: mindustry backend rewritten %s -> %s", backend_addr, rewritten)
@@ -686,9 +680,8 @@ func main() {
 	defer release_all_client_local_routes()
 	defer undo_lo_alias()
 
-	// undo lo alias on SIGINT / SIGTERM as well as normal return
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig_ch := make(chan os.Signal, 1)
+	signal.Notify(sig_ch, syscall.SIGINT, syscall.SIGTERM)
 
 	listen_addr, err := net.ResolveTCPAddr("tcp", args.Listen)
 	if err != nil {
@@ -706,7 +699,7 @@ func main() {
 		listen_addr.String(), backend_addr, tproxy)
 
 	go func() {
-		sig := <-sigCh
+		sig := <-sig_ch
 		log.Printf("received %v, shutting down", sig)
 		_ = listener.Close()
 	}()
@@ -714,7 +707,6 @@ func main() {
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			// listener closed on signal → exit accept loop; defer undoes lo
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
