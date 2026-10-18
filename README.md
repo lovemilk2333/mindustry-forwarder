@@ -171,8 +171,7 @@ sudo mindustry-forwarder-decoder -l :6568 -m 127.0.0.1:6567
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-l`, `--listen` | `:6568` | Tunnel listen `host:port` |
-| `-m`, `--mindustry` | `127.0.0.1:6567` | Backend game server |
-| `-p`, `--mindustry-port` | — | Shorthand backend `127.0.0.1:<port>` (overrides host of `-m`) |
+| `-m`, `--mindustry` | `127.0.0.1:6567` | Backend game server (`host:port`; bare `:port` or `port` → `127.0.0.1:port`) |
 | `--timeout` | `5s` | Context read + dial timeout |
 | `--setup-lo-ip` | `172.31.255.1` | Lo alias when auto-setup runs |
 | `--no-auto-setup-lo` | off | Do not rewrite 127/8 backends |
@@ -190,7 +189,7 @@ Spoofing a foreign source toward `127.0.0.0/8` cannot finish TCP handshake
 4. **Per session**: `ip route replace local <clientIP>/32 dev lo` (refcounted) so SYN-ACK / UDP replies to the spoofed source stay on this host  
 5. On **SIGINT / SIGTERM / exit**: drop client local routes, run setup undo, remove lo alias  
 
-Needs **root** (or `CAP_NET_ADMIN`), `bash`, and `ip` (iproute2).
+Needs **root** (or `CAP_NET_ADMIN`), `bash` (via `/usr/bin/env`), and `ip` (iproute2).
 
 Non-loopback backend (no rewrite):
 

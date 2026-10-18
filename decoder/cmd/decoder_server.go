@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/binary"
@@ -14,6 +15,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,17 +29,19 @@ var setup_lo_transparent_script []byte
 
 // Protocol constants (shared with encoder/encoder_server.py).
 const (
-	min_context_length    = 1 + 2 // flags + port (uint16 BE)
-	ipv4_length           = 4
-	ipv6_length           = 16
-	is_tcp_mask           = 1
-	is_ipv6_mask          = 128
-	udp_frame_header_size = 2
-	udp_max_payload       = 65535
+	MIN_CONTEXT_LENGTH    = 1 + 2 // flags + port (uint16 BE)
+	IPV4_LENGTH           = 4
+	IPV6_LENGTH           = 16
+	IS_TCP_MASK           = 1
+	IS_IPV6_MASK          = 128
+	UDP_FRAME_HEADER_SIZE = 2
+	UDP_MAX_PAYLOAD       = 65535
 )
 
+const FALLBACK_LO_IP = "172.31.255.1"
+
 // Linux: IPV6_TRANSPARENT is not in older x/sys snapshots used by some Go toolchains.
-const ipv6_transparent = 75 // include/uapi/linux/in6.h IPV6_TRANSPARENT
+const IPV6_TRANSPARENT = 75 // include/uapi/linux/in6.h IPV6_TRANSPARENT
 
 // Context is the per-tunnel client description parsed from the encoder header.
 // Exported name so logs / fmt treat it as a first-class type; fields are private.
@@ -65,13 +70,12 @@ func (this *Context) String() string {
 
 // CLI flags — field names must be PascalCase for go-arg reflection.
 var args struct {
-	Listen            string        `arg:"-l,--listen" default:":6568" help:"TCP tunnel listen host and port"`
-	Mindustry         string        `arg:"-m,--mindustry" default:"127.0.0.1:6567" help:"Mindustry server host:port"`
-	MindustryPortOnly uint16        `arg:"-p,--mindustry-port" help:"shorthand: use 127.0.0.1:<port> as Mindustry address (overrides --mindustry host)"`
-	Timeout           time.Duration `default:"5s"`
-	NoTransparent     bool          `arg:"--no-transparent" help:"never use IP_TRANSPARENT (always dial with local address)"`
-	SetupLoIP         string        `arg:"--setup-lo-ip" default:"172.31.255.1" help:"lo alias IP used when backend is 127/8 (auto setup)"`
-	NoAutoSetupLo     bool          `arg:"--no-auto-setup-lo" help:"do not auto-configure lo alias when backend is 127/8"`
+	Listen        string        `arg:"-l,--listen" default:":6568" help:"TCP tunnel listen host and port"`
+	Mindustry     string        `arg:"-m,--mindustry" default:"127.0.0.1:6567" help:"Mindustry server host:port (bare :port or port -> 127.0.0.1:port)"`
+	Timeout       time.Duration `default:"5s"`
+	NoTransparent bool          `arg:"--no-transparent" help:"never use IP_TRANSPARENT (always dial with local address)"`
+	SetupLoIP     string        `arg:"--setup-lo-ip" default:"172.31.255.1" help:"lo alias IP used when backend is 127.0.0.0/8 (auto setup)"`
+	NoAutoSetupLo bool          `arg:"--no-auto-setup-lo" help:"do not auto-configure lo alias when backend is 127.0.0.0/8"`
 }
 
 // set when auto setup-lo succeeded; cleared by undo on exit.
@@ -86,29 +90,29 @@ var (
 
 func parse_context(data []byte) (int, *Context, error) {
 	length := len(data)
-	if length < min_context_length {
+	if length < MIN_CONTEXT_LENGTH {
 		return 0, nil, errors.New("context too short")
 	}
 
 	used_length := 0
 	flags := data[0]
-	is_ipv6 := flags&is_ipv6_mask == is_ipv6_mask
-	is_tcp := flags&is_tcp_mask == is_tcp_mask
+	is_ipv6 := flags&IS_IPV6_MASK == IS_IPV6_MASK
+	is_tcp := flags&IS_TCP_MASK == IS_TCP_MASK
 	port := (uint16(data[1]) << 8) | uint16(data[2])
 
 	var ip netip.Addr
 	if is_ipv6 {
-		if length < min_context_length+ipv6_length {
+		if length < MIN_CONTEXT_LENGTH+IPV6_LENGTH {
 			return 0, nil, errors.New("context too short")
 		}
-		ip = netip.AddrFrom16([ipv6_length]byte(data[3 : 3+ipv6_length]))
-		used_length = min_context_length + ipv6_length
+		ip = netip.AddrFrom16([IPV6_LENGTH]byte(data[3 : 3+IPV6_LENGTH]))
+		used_length = MIN_CONTEXT_LENGTH + IPV6_LENGTH
 	} else {
-		if length < min_context_length+ipv4_length {
+		if length < MIN_CONTEXT_LENGTH+IPV4_LENGTH {
 			return 0, nil, errors.New("context too short")
 		}
-		ip = netip.AddrFrom4([ipv4_length]byte(data[3 : 3+ipv4_length]))
-		used_length = min_context_length + ipv4_length
+		ip = netip.AddrFrom4([IPV4_LENGTH]byte(data[3 : 3+IPV4_LENGTH]))
+		used_length = MIN_CONTEXT_LENGTH + IPV4_LENGTH
 	}
 
 	return used_length, (&Context{
@@ -121,16 +125,16 @@ func parse_context(data []byte) (int, *Context, error) {
 
 // read_context reads a variable-length context header from conn.
 func read_context(conn net.Conn) (*Context, error) {
-	head := make([]byte, min_context_length)
+	head := make([]byte, MIN_CONTEXT_LENGTH)
 	if _, err := io.ReadFull(conn, head); err != nil {
 		return nil, err
 	}
 
 	flags := head[0]
-	is_ipv6 := flags&is_ipv6_mask == is_ipv6_mask
-	addr_len := ipv4_length
+	is_ipv6 := flags&IS_IPV6_MASK == IS_IPV6_MASK
+	addr_len := IPV4_LENGTH
 	if is_ipv6 {
-		addr_len = ipv6_length
+		addr_len = IPV6_LENGTH
 	}
 
 	addr := make([]byte, addr_len)
@@ -140,6 +144,36 @@ func read_context(conn net.Conn) (*Context, error) {
 
 	_, ctx, err := parse_context(append(head, addr...))
 	return ctx, err
+}
+
+// normalize_mindustry_addr turns CLI -m values into host:port.
+// ":6567" or "6567" -> "127.0.0.1:6567"; otherwise must already be host:port.
+func normalize_mindustry_addr(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("empty mindustry address")
+	}
+
+	// bare port: "6567"
+	if port, err := strconv.ParseUint(value, 10, 16); err == nil && port > 0 {
+		return net.JoinHostPort("127.0.0.1", strconv.FormatUint(port, 10)), nil
+	}
+
+	// ":6567"
+	if strings.HasPrefix(value, ":") {
+		port_s := value[1:]
+		port, err := strconv.ParseUint(port_s, 10, 16)
+		if err != nil || port == 0 {
+			return "", fmt.Errorf("invalid mindustry port in %q", value)
+		}
+		return net.JoinHostPort("127.0.0.1", strconv.FormatUint(port, 10)), nil
+	}
+
+	// already host:port (including [ipv6]:port)
+	if _, _, err := net.SplitHostPort(value); err != nil {
+		return "", fmt.Errorf("invalid mindustry host:port %q: %w", value, err)
+	}
+	return value, nil
 }
 
 func backend_host_is_loopback(backend_addr string) bool {
@@ -163,7 +197,7 @@ func want_transparent(backend_addr string) bool {
 		return false
 	}
 	// Spoofing a foreign source toward 127.0.0.1/::1 almost always fails
-	// (SYN never completes → dial i/o timeout). Skip transparent on loopback
+	// (SYN never completes -> dial i/o timeout). Skip transparent on loopback
 	// backends; client IP is still logged from the context header.
 	if backend_host_is_loopback(backend_addr) {
 		return false
@@ -179,7 +213,7 @@ func set_ip_transparent(network string, c syscall.RawConn) error {
 			dial_err = e
 		}
 		if network == "tcp6" || network == "udp6" {
-			if e := syscall.SetsockoptInt(f, syscall.IPPROTO_IPV6, ipv6_transparent, 1); e != nil {
+			if e := syscall.SetsockoptInt(f, syscall.IPPROTO_IPV6, IPV6_TRANSPARENT, 1); e != nil {
 				dial_err = e
 			} else {
 				dial_err = nil
@@ -268,7 +302,7 @@ func bytes_trim(b []byte) string {
 //
 // Why not DialUDP? Mindustry often replies from a different local IP than the
 // dial target (e.g. dial 172.31.255.1:6567, reply from 10.0.0.100:6567). A
-// connected UDP socket drops those replies → s2c i/o timeout.
+// connected UDP socket drops those replies -> s2c i/o timeout.
 func dial_udp_unconnected(ctx *Context, backend_addr string, transparent bool) (net.Conn, string, error) {
 	raddr, err := net.ResolveUDPAddr("udp", backend_addr)
 	if err != nil {
@@ -439,20 +473,20 @@ func tune_udp_conn(conn net.Conn) {
 // write_udp_frame writes one length-prefixed frame in a single syscall when possible.
 func write_udp_frame(w net.Conn, payload []byte) error {
 	n := len(payload)
-	if n > udp_max_payload {
+	if n > UDP_MAX_PAYLOAD {
 		return fmt.Errorf("UDP payload too large: %d", n)
 	}
-	frame := make([]byte, udp_frame_header_size+n)
-	binary.BigEndian.PutUint16(frame[:udp_frame_header_size], uint16(n))
-	copy(frame[udp_frame_header_size:], payload)
+	frame := make([]byte, UDP_FRAME_HEADER_SIZE+n)
+	binary.BigEndian.PutUint16(frame[:UDP_FRAME_HEADER_SIZE], uint16(n))
+	copy(frame[UDP_FRAME_HEADER_SIZE:], payload)
 	_, err := w.Write(frame)
 	return err
 }
 
 // relay_udp_c2s: tunnel TCP -> Mindustry UDP (length-prefixed frames)
 func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
-	hdr := make([]byte, udp_frame_header_size)
-	body := make([]byte, udp_max_payload)
+	hdr := make([]byte, UDP_FRAME_HEADER_SIZE)
+	body := make([]byte, UDP_MAX_PAYLOAD)
 	for {
 		if _, err := io.ReadFull(tunnel, hdr); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -461,7 +495,7 @@ func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 			return
 		}
 		length := int(binary.BigEndian.Uint16(hdr))
-		if length > udp_max_payload {
+		if length > UDP_MAX_PAYLOAD {
 			log.Printf("%s UDP c2s frame too large: %d", session, length)
 			return
 		}
@@ -480,7 +514,7 @@ func relay_udp_c2s(backend net.Conn, tunnel net.Conn, session *Context) {
 
 // relay_udp_s2c: Mindustry UDP -> tunnel TCP (length-prefixed frames)
 func relay_udp_s2c(tunnel net.Conn, backend net.Conn, session *Context) {
-	buf := make([]byte, udp_max_payload)
+	buf := make([]byte, UDP_MAX_PAYLOAD)
 	for {
 		n, err := backend.Read(buf)
 		if err != nil {
@@ -574,43 +608,59 @@ func forward_handler(backend_addr string, conn *net.TCPConn) {
 }
 
 // run_embedded_setup_lo extracts the embedded script to a temp file, runs it,
-// then deletes the temp tree (use-once). Returns the script exit code.
-func run_embedded_setup_lo(undo bool, alias_ip string, quiet bool) int {
+// then deletes the temp tree (use-once).
+//
+// Always captures script stdout+stderr (nil Stdout would inherit the parent and
+// bypass our logger). On success with quiet=false, lines are logged with the
+// decoder prefix. On failure, detail is the trimmed script output (or the
+// exec error) so callers can include it in Fatalf / log lines.
+func run_embedded_setup_lo(undo bool, alias_ip string, quiet bool) (code int, detail string) {
 	dir, err := os.MkdirTemp("", "mindustry-forwarder-setup-lo-*")
 	if err != nil {
-		log.Printf("setup-lo: cannot create temp dir: %v", err)
-		return 1
+		return 1, fmt.Sprintf("cannot create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
 
 	script_path := filepath.Join(dir, "setup-lo-transparent.sh")
 	if err := os.WriteFile(script_path, setup_lo_transparent_script, 0o700); err != nil {
-		log.Printf("setup-lo: cannot write embedded script: %v", err)
-		return 1
+		return 1, fmt.Sprintf("cannot write embedded script: %v", err)
 	}
 
-	argv := []string{script_path}
+	// env bash <script> [--undo] [--quiet] <alias_ip>
+	// --quiet only suppresses the script's own echo; we still capture everything.
+	args := make([]string, 0, 4)
 	if undo {
-		argv = append(argv, "--undo", alias_ip)
-	} else {
-		argv = append(argv, alias_ip)
+		args = append(args, "--undo")
+	}
+	if quiet {
+		args = append(args, "--quiet")
+	}
+	args = append(args, alias_ip)
+
+	cmd := exec.Command("/usr/bin/env", append([]string{"bash", script_path}, args...)...)
+	var captured bytes.Buffer
+	cmd.Stdout = &captured
+	cmd.Stderr = &captured
+	run_err := cmd.Run()
+	out := strings.TrimSpace(captured.String())
+
+	if run_err == nil {
+		if !quiet && out != "" {
+			for _, line := range strings.Split(out, "\n") {
+				log.Printf("setup-lo: %s", line)
+			}
+		}
+		return 0, out
 	}
 
-	cmd := exec.Command("/usr/bin/env", append([]string{"bash"}, argv...)...)
-	if quiet {
-		cmd.Env = append(os.Environ(), "MINDUSTRY_SETUP_LO_QUIET=1")
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+	detail = out
+	if detail == "" {
+		detail = run_err.Error()
 	}
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode()
-		}
-		log.Printf("setup-lo failed: %v", err)
-		return 1
+	if ee, ok := run_err.(*exec.ExitError); ok {
+		return ee.ExitCode(), detail
 	}
-	return 0
+	return 1, detail
 }
 
 func undo_lo_alias() {
@@ -619,15 +669,19 @@ func undo_lo_alias() {
 	}
 	ip := lo_alias_active
 	lo_alias_active = ""
-	code := run_embedded_setup_lo(true, ip, true)
+	code, detail := run_embedded_setup_lo(true, ip, true)
 	if code != 0 {
-		log.Printf("setup-lo undo failed (exit %d) for %s", code, ip)
+		if detail != "" {
+			log.Printf("setup-lo undo failed (exit %d) for %s: %s", code, ip, detail)
+		} else {
+			log.Printf("setup-lo undo failed (exit %d) for %s", code, ip)
+		}
 		return
 	}
 	log.Printf("setup-lo: removed lo alias %s", ip)
 }
 
-// maybe_auto_setup_lo: when backend is 127/8 and transparent is desired,
+// maybe_auto_setup_lo: when backend is 127.0.0.0/8 and transparent is desired,
 // add a non-127 alias on lo and rewrite backend_addr to that alias.
 func maybe_auto_setup_lo(backend_addr string) string {
 	if args.NoTransparent || args.NoAutoSetupLo {
@@ -644,16 +698,19 @@ func maybe_auto_setup_lo(backend_addr string) string {
 
 	alias := args.SetupLoIP
 	if alias == "" {
-		alias = "172.31.255.1"
+		alias = FALLBACK_LO_IP
 	}
 	if ip := net.ParseIP(alias); ip == nil || ip.IsLoopback() {
 		log.Fatalf("invalid --setup-lo-ip %q (must be a non-127 IP)", alias)
 	}
 
-	log.Printf("setup-lo: backend is 127/8 — configuring lo alias %s (auto)", alias)
-	code := run_embedded_setup_lo(false, alias, false)
+	log.Printf("setup-lo: configuring 127.0.0.0/8 backend interface `lo` alias: %s", alias)
+	code, detail := run_embedded_setup_lo(false, alias, false)
 	if code != 0 {
-		log.Fatalf("setup-lo failed (exit %d); re-run as root, or use --no-auto-setup-lo / --no-transparent", code)
+		if detail != "" {
+			log.Fatalf("setup-lo failed (exit %d), use --no-auto-setup-lo / --no-transparent to disable setup: %s", code, detail)
+		}
+		log.Fatalf("setup-lo failed (exit %d), re-run as root, or use --no-auto-setup-lo / --no-transparent to disable setup", code)
 	}
 	lo_alias_active = alias
 
@@ -668,12 +725,9 @@ func main() {
 
 	arg.MustParse(&args)
 
-	backend_addr := args.Mindustry
-	if args.MindustryPortOnly != 0 {
-		backend_addr = fmt.Sprintf("127.0.0.1:%d", args.MindustryPortOnly)
-	}
-	if _, _, err := net.SplitHostPort(backend_addr); err != nil {
-		log.Fatalf("invalid --mindustry host:port %q: %v", backend_addr, err)
+	backend_addr, err := normalize_mindustry_addr(args.Mindustry)
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	backend_addr = maybe_auto_setup_lo(backend_addr)
