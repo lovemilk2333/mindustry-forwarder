@@ -111,10 +111,21 @@ Encoder: each TCP-read frame → one `sendto` to the original client `(ip, port)
 
 ## Build (decoder only)
 
+Firstly, setup Zig with aarch64-linux-gnu.2.31 for Linux 5.15
+```bash
+mkdir -p "$HOME/tools"
+curl -sL -o /tmp/zig.tar.xz \
+    https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
+tar -C "$HOME/tools" -xf /tmp/zig.tar.xz
+mv "$HOME/tools/zig-x86_64-linux-0.14.1" "$HOME/tools/zig"
+```
+
+---
+
 ```bash
 make                  # amd64 + arm64
 make decoder-amd64    # → bin/decoder/amd64/mindustry-forwarder-decoder
-make decoder-arm64    # → bin/decoder/arm64/mindustry-forwarder-decoder
+make decoder-arm64-5.15    # → bin/decoder/arm64-5.15/mindustry-forwarder-decoder
 make decoder          # both
 make DEBUG=1 decoder-amd64
 make clean            # rm -rf bin
@@ -124,7 +135,7 @@ make help
 | Target | Output | Linkage |
 |--------|--------|---------|
 | `decoder-amd64` | `bin/decoder/amd64/mindustry-forwarder-decoder` | `CGO_ENABLED=0`, static Linux amd64 |
-| `decoder-arm64` | `bin/decoder/arm64/mindustry-forwarder-decoder` | Zig `aarch64-linux-gnu.2.31`, `CGO_ENABLED=1`, `-linkmode external` |
+| `decoder-arm64-5.15` | `bin/decoder/arm64-5.15/mindustry-forwarder-decoder` | Zig `aarch64-linux-gnu.2.31`, `CGO_ENABLED=1`, `-linkmode external` |
 
 - Build the whole package `./cmd` so `//go:embed setup-lo-transparent.sh` is included.
 - ARM64 needs Zig at `$HOME/tools/zig/zig` (override with `ZIG=…` only if you edit the Makefile).
